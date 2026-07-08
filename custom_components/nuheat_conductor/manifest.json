@@ -1,0 +1,11 @@
+{
+  "domain": "nuheat_conductor",
+  "name": "NuHeat Conductor",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["application_credentials"],
+  "documentation": "https://api.mynuheat.com/",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "version": "0.1.0"
+}
