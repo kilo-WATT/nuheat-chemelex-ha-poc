@@ -1,0 +1,45 @@
+name: API bug
+description: Report a reproducible, sanitized OpenAPI client problem
+title: "[API] "
+labels: ["api"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include tokens, OAuth codes, credentials, complete response bodies, serial numbers, email addresses, or unredacted config-entry data.
+  - type: input
+    id: version
+    attributes:
+      label: Commit or package version
+    validations:
+      required: true
+  - type: dropdown
+    id: operation
+    attributes:
+      label: Operation
+      options: [Account lookup, Thermostat list, Thermostat read, Target write, Mode write, OAuth refresh, Other]
+    validations:
+      required: true
+  - type: input
+    id: endpoint
+    attributes:
+      label: Sanitized endpoint path and HTTP status
+      description: Omit host query strings, headers, and body. Example `/api/v2/Thermostat` HTTP 503.
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sanitization confirmation
+      options:
+        - label: I removed all credentials, tokens, authorization codes, headers, response bodies, serials, account data, and personal information.
+          required: true

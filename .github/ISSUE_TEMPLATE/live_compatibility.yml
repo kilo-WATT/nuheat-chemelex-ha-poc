@@ -1,0 +1,51 @@
+name: Live-device compatibility report
+description: Submit sanitized Signature or Conductor test results
+title: "[Compatibility] "
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: Follow `docs/LIVE_TESTING.md`. Never submit credentials, tokens, OAuth codes, serials, email addresses, room names, complete response bodies, or config-entry data.
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version and installation type
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Integration commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: family
+    attributes:
+      label: Thermostat family
+      options: [Signature, Conductor, Unknown]
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and firmware, if visible
+  - type: input
+    id: matrix
+    attributes:
+      label: Matrix case
+      description: Example `multiple thermostats / HA Fahrenheit / Auto`.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and observed result
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sanitization confirmation
+      options:
+        - label: I used aliases for devices and removed all secrets, identifiers, personal information, headers, bodies, and config-entry data.
+          required: true

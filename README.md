@@ -1,204 +1,152 @@
-# NuHeat Conductor for Home Assistant
+# NuHeat / Chemelex Home Assistant proof of concept
 
-This repository contains a Home Assistant custom-integration proof of concept
-and a standalone async client for the documented Chemelex/NuHeat OpenAPI v2.
-It does not replace Home Assistant's built-in `nuheat` integration or modify a
-live Home Assistant configuration.
+This repository contains a review-oriented Home Assistant custom integration
+and a typed async library for the documented Chemelex NuHeat OpenAPI v2. It is
+development work only: it does not replace Home Assistant's built-in `nuheat`
+integration, migrate existing entries, publish a package, or modify a live Home
+Assistant configuration.
 
 ## Repository layout
 
 ```text
-custom_components/nuheat_conductor/  Home Assistant custom integration
-src/chemelex_nuheat/                  Standalone async reference client
-tests/                               Mocked client and integration tests
-README.md                            Design, setup, and maintainer notes
-pyproject.toml                       Package and test configuration
+custom_components/nuheat_conductor/  Home Assistant proof-of-concept integration
+src/chemelex_nuheat/                  HA-independent aiohttp API library
+tests/                               Mocked API and integration tests
+docs/                                Upstream decisions and live-testing plan
+.github/                             CI and structured issue templates
 ```
 
-## Authentication
+## Architecture
 
-Request your own OAuth client registration from Chemelex/NuHeat. Copy
-`.env.example` to `.env` and fill in the issued client ID, registered redirect
-URI, and client secret only if one was issued. `.env` is gitignored.
+`chemelex_nuheat.NuHeatClient` owns endpoint paths, request/response parsing,
+centi-Celsius encoding, thermostat models, commands, retry classification, and
+safe error mapping. It accepts an injected `aiohttp.ClientSession` and an async
+access-token provider. It does not import Home Assistant and does not store or
+refresh OAuth tokens.
 
-The initial flow is Authorization Code + PKCE:
+The custom integration obtains Home Assistant's shared aiohttp session and uses
+`OAuth2Session` for token storage, refresh, and refresh-token rotation. Its
+Application Credentials fallback constructs Home Assistant's built-in
+`LocalOAuth2ImplementationWithPkce`. The config flow remains based on
+`AbstractOAuth2FlowHandler`, so a future Cloud Account Linking implementation
+can be registered without changing the API or thermostat code.
 
-```python
-import asyncio
-from urllib.parse import parse_qs, urlparse
-from chemelex_nuheat import NuHeatClient
+No OAuth client ID, client secret, access token, refresh token, authorization
+code, password, or mobile-app credential belongs in this repository.
 
-async def main():
-    async with NuHeatClient.from_env() as client:
-        print(await client.authorization_url())
-        callback = urlparse(input("Paste the complete redirect URL: "))
-        query = parse_qs(callback.query)
-        tokens = await client.authenticate(
-            authorization_code=query["code"][0], state=query["state"][0]
-        )
-        # Persist tokens.refresh_token in a secure store; it can rotate.
-        print(await client.list_thermostats())
+## API behavior
 
-asyncio.run(main())
-```
+- Base host: `https://api.nam.mynuheat.com`
+- API generation: documented v2 endpoints
+- Polling: every five minutes
+- Temperatures: centi-Celsius at the HTTP boundary and Celsius in every library
+  model
+- Modes: Auto, Hold, and Manual; there is no exposed Off mode without a
+  documented and tested endpoint
+- Limits: v2 has not been confirmed to expose native thermostat min/max values;
+  conservative defaults exist only in the Home Assistant entity
+- Discovery: later coordinator refreshes add newly discovered thermostats while
+  retaining existing entities and marking omitted/offline devices unavailable
 
-For a real Home Assistant integration, the callback's `state` must also be
-passed to `authenticate`, tokens should live in the config entry, and the
-`token_update_callback` should persist every rotated token set.
+Home Assistant entity values follow the installation's configured temperature
+unit. Reads convert library Celsius to Celsius or Fahrenheit. Service calls are
+converted back to Celsius before reaching the API library.
 
-## Client surface
+## OAuth paths
 
-- `authenticate`
-- `authorization_url`
-- `list_thermostats`
-- `get_thermostat(serial_number)`
-- `set_target_temperature(serial_number, celsius)`
-- `set_schedule_mode(serial_number, auto|hold|manual, ...)`
+### Development and testing
 
-Normalized thermostat temperatures are Celsius. Based on the API guide's
-temperature examples, the OpenAPI encodes them as integer hundredths of a
-degree (`22.5 C` becomes `2250`). The v2 response
-schema exposes current/target temperature, heating, online, name, mode, hold
-time, and error state. It does **not** expose min/max values. Those therefore
-remain `None` unless supplied as client constructor defaults, or unless a
-future compatible response includes `minTemperature`/`maxTemperature`.
+Use a legitimate OAuth application registration issued by Chemelex and enter
+it through Home Assistant's **Application credentials** UI. The client secret
+may be empty if Chemelex registers a public PKCE client. The normal NuHeat
+config flow never asks users to type client credentials directly.
 
-## Legacy Home Assistant contract
+If no OAuth implementation is registered, the development build reports:
 
-The current HA entity receives one `NuHeatThermostat` and polls `get_data()`
-every five minutes. It reads:
+> OAuth application credentials are required for this development build. A
+> future official Home Assistant integration should use centrally managed
+> credentials.
 
-- identity/availability: `serial_number`, `room`, `online`
-- state: `celsius`/`fahrenheit`, `target_temperature`, `heating`
-- limits: `min_celsius`/`max_celsius` or Fahrenheit equivalents
-- mode: `schedule_mode` (`1` run, `2` temporary hold, `3` permanent hold)
+### Public and official path
 
-It writes `schedule_mode` as a property and calls
-`set_target_temperature(raw_temperature, schedule_mode)`. Setup also expects
-`NuHeat(username, password)`, synchronous `authenticate()`, and
-`get_thermostat(serial)`. A production migration therefore needs more than a
-manifest bump: HA's config flow must become OAuth/application-credentials,
-the coordinator and entity must await async methods, and the entity should use
-the normalized model rather than the old package's unusual temperature format.
+The intended public path is a Chemelex-issued Home Assistant OAuth application
+managed through Home Assistant Cloud Account Linking. That coordination belongs
+to Chemelex and OHF/Nabu Casa. It should let end users link NuHeat without
+creating their own OAuth application and without publishing a shared secret.
 
-## Tests
+## Local development
+
+Use the Python version required by current Home Assistant Core (Python 3.13 at
+the time of this readiness pass):
 
 ```shell
-python -m pip install -e ".[dev]"
-python -m pytest
+python -m venv .venv
+.venv/Scripts/python -m pip install -e ".[dev]"
+.venv/Scripts/python -m pytest
+.venv/Scripts/ruff check .
+.venv/Scripts/ruff format --check .
+.venv/Scripts/mypy
+.venv/Scripts/python -m build
 ```
 
-All HTTP is mocked with `httpx.MockTransport`; tests do not contact NuHeat.
+On POSIX systems, use `.venv/bin/` instead of `.venv/Scripts/`.
 
-## Public references
+All tests use mocked HTTP/OAuth responses. They do not validate the live NuHeat
+service. Live validation must follow [docs/LIVE_TESTING.md](docs/LIVE_TESTING.md).
 
-- NuHeat OpenAPI guide: <https://api.mynuheat.com/>
-- v2 Swagger schema: <https://api.mynuheat.com/swagger/v2/swagger.json>
-- OIDC discovery: <https://identity.mynuheat.com/.well-known/openid-configuration>
-- legacy HA integration: <https://github.com/home-assistant/core/tree/master/homeassistant/components/nuheat>
-- legacy python package: <https://github.com/broox/python-nuheat>
+## Installing the development custom integration
 
-## Maintainer Notes
+This package is intentionally not on PyPI. On a disposable Home Assistant
+development environment:
 
-- The old `www.mynuheat.com/api` username/password API used by the current
-  `nuheat==1.0.1` Home Assistant integration appears obsolete following the
-  Chemelex/NuHeat platform migration.
-- This proof of concept uses the published Chemelex/NuHeat OpenAPI v2 at
-  `https://api.mynuheat.com`, with OAuth 2.0 Authorization Code + PKCE and
-  refresh-token rotation.
-- The principal blocker for a public Home Assistant integration is an official
-  OAuth client registration issued by Chemelex for Home Assistant. No shared
-  client secret, mobile-app credential, or reverse-engineered credential is
-  included here.
-- The desired production end state is Home Assistant Cloud Account Linking,
-  backed by the Chemelex-issued Home Assistant OAuth application. End users
-  should then authorize their account without creating a client registration.
-- Home Assistant Application Credentials remain supported strictly as a
-  development and local-testing fallback. They are not the intended public
-  onboarding experience.
+1. Clone this repository.
+2. Install the library into the same Python environment with
+   `python -m pip install -e /path/to/repository`.
+3. Copy `custom_components/nuheat_conductor/` to
+   `<config>/custom_components/nuheat_conductor/`.
+4. Restart the development Home Assistant instance.
+5. Add legitimate Chemelex development credentials under **Settings → Devices
+   & services → Application credentials**.
+6. Add **NuHeat Conductor** and complete the OAuth consent flow.
 
-## Home Assistant custom integration
+Do not perform these steps against a production instance until the integration
+has received review and the live test plan has been completed.
 
-The proof of concept now includes a separate custom integration at
-`custom_components/nuheat_conductor`. It does not replace or modify Home
-Assistant's built-in `nuheat` integration.
-
-### Development/testing path: local Application Credentials
-
-This custom development build intentionally contains no shared client secret.
-For local testing:
-
-1. Request a legitimate development OAuth client ID and secret from
-   NuHeat/Chemelex.
-2. Register Home Assistant's OAuth redirect URI with NuHeat. With the `my`
-   integration enabled this is
-   `https://my.home-assistant.io/redirect/oauth`; otherwise it is
-   `<your Home Assistant URL>/auth/external/callback`.
-3. Copy the complete `custom_components/nuheat_conductor` directory to
-   `/config/custom_components/nuheat_conductor` on the Home Assistant host.
-4. Restart Home Assistant.
-5. Open **Settings → Devices & services → ⋮ → Application credentials**.
-6. Add credentials for **NuHeat Conductor**, entering only the client ID and
-   client secret issued for your own registration.
-7. Open **Settings → Devices & services → Add integration**, select
-   **NuHeat Conductor**, choose those credentials, and complete NuHeat's OAuth
-   consent page.
-
-The integration's normal config flow never asks for a client ID or secret. It
-only selects from OAuth implementations already registered with Home Assistant.
-Application Credentials supplies the local development implementation.
-
-If neither a local implementation nor a centrally managed implementation is
-available, setup stops with: “OAuth application credentials are required for
-this development build. A future official Home Assistant integration should
-use centrally managed credentials.”
-
-### Public/official path: Home Assistant Cloud Account Linking
-
-The upstream path is for Chemelex to issue an OAuth application specifically
-for Home Assistant, followed by registration with Home Assistant Cloud Account
-Linking. Home Assistant can then register that centrally managed OAuth
-implementation with the same abstract config flow. End users would select the
-integration and authorize their NuHeat account; they would not create or enter
-their own client credentials.
-
-The local PKCE implementation is isolated in `oauth.py` and is constructed only
-by `application_credentials.py`. The config flow, config entry, API client, and
-token-refresh path depend on Home Assistant's abstract OAuth implementation,
-so introducing a cloud provider does not require changing thermostat logic or
-storing a secret in this repository.
-
-No YAML configuration is accepted by the integration. OAuth access and refresh
-tokens are stored in the Home Assistant config entry and refreshed by Home
-Assistant's `OAuth2Session`; rotated refresh tokens replace the old value.
-
-### Debug logging
-
-Add this temporarily to `/config/configuration.yaml`, then restart Home
-Assistant:
+Temporary debug logging:
 
 ```yaml
 logger:
   default: info
   logs:
     custom_components.nuheat_conductor: debug
+    chemelex_nuheat: debug
 ```
 
-Remove the override after diagnosis. The integration deliberately does not log
-OAuth tokens, client secrets, authorization codes, or API response bodies.
+The current code does not log response bodies or OAuth secrets. Still sanitize
+all logs before attaching them to an issue.
 
-### Integration assumptions and API limits
+## Maintainer notes
 
-- OpenAPI v2 has Auto, Hold, and Manual endpoints but no off endpoint. The HA
-  entity therefore exposes only `HVACMode.HEAT`; API modes are exposed as
-  `auto`, `hold`, and `manual` presets.
-- The thermostat model's integer modes are mapped as `1=Auto`, `2=Hold`, and
-  `3=Manual`, matching the published mode examples and legacy NuHeat values.
-- Temperatures are normalized to Celsius; API integers are treated as
-  hundredths of a degree based on the published examples.
-- V2 does not publish native min/max temperatures. The entity layer alone uses
-  Home Assistant's conservative defaults of 7–35 °C when values are absent.
-- The v2 Account model exposes `userName` but no stable account ID, so its
-  case-folded username/email is the config-entry unique ID.
-- Thermostats are polled every five minutes. Writes refresh the affected
-  thermostat immediately from the cloud response path.
+- The old MyNuHeat username/password API used by Home Assistant's existing
+  integration appears obsolete after the Chemelex platform migration.
+- This proof of concept uses the official NuHeat OpenAPI v2 design and the NAM
+  API host identified by Chemelex.
+- Official OAuth registration and Cloud Account Linking remain the public
+  integration blocker. Local Application Credentials are a development fallback.
+- Domain choice, migration strategy, device compatibility, setpoint semantics,
+  standby, and stable account identity remain explicit upstream decisions.
+
+See [docs/UPSTREAM_DECISIONS.md](docs/UPSTREAM_DECISIONS.md) for the complete
+decision record.
+
+## References
+
+- [NuHeat OpenAPI documentation](https://api.nam.mynuheat.com/)
+- [NuHeat OIDC discovery](https://identity.mynuheat.com/.well-known/openid-configuration)
+- [Home Assistant Application Credentials](https://developers.home-assistant.io/docs/core/platform/application_credentials/)
+- [Home Assistant OAuth config flows](https://developers.home-assistant.io/docs/core/integration/config_flow/#configuration-via-oauth2)
+- [Existing Home Assistant NuHeat integration](https://github.com/home-assistant/core/tree/dev/homeassistant/components/nuheat)
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
