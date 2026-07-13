@@ -2,63 +2,59 @@
 
 from __future__ import annotations
 
-import asyncio
-import base64
+import math
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
-from enum import Enum
-import hashlib
-import json
-import os
-import secrets
-from typing import Any
-from urllib.parse import urlencode
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import IntEnum, StrEnum
+from http import HTTPStatus
+from typing import Any, Final
+from urllib.parse import quote
 
-import httpx
+from aiohttp import ClientError, ClientResponse, ClientSession, ContentTypeError
 
-DISCOVERY_URL = "https://identity.mynuheat.com/.well-known/openid-configuration"
-API_BASE_URL = "https://api.mynuheat.com"
-DEFAULT_SCOPES = ("openid", "openapi", "offline_access")
-EXPIRY_SKEW = timedelta(seconds=30)
+API_BASE_URL: Final = "https://api.nam.mynuheat.com"
 
 
 class NuHeatApiError(RuntimeError):
-    """A NuHeat API request failed."""
+    """A retryable NuHeat transport or cloud-service failure."""
 
 
-class NuHeatAuthError(NuHeatApiError):
-    """Authentication or token refresh failed."""
+class NuHeatAuthError(RuntimeError):
+    """NuHeat rejected the current authorization."""
 
 
-class ScheduleMode(str, Enum):
-    """Documented v2 thermostat operating modes."""
+class NuHeatDataError(RuntimeError):
+    """NuHeat returned a response that does not match the documented schema."""
+
+
+class ScheduleMode(StrEnum):
+    """Documented OpenAPI v2 thermostat mode commands."""
 
     AUTO = "auto"
     HOLD = "hold"
     MANUAL = "manual"
 
 
+class ThermostatMode(IntEnum):
+    """Mode values currently shown by the v2 OpenAPI examples."""
+
+    AUTO = 1
+    HOLD = 2
+    MANUAL = 3
+
+
 @dataclass(frozen=True, slots=True)
-class TokenSet:
-    """OAuth token set, including its calculated expiry time."""
+class Account:
+    """NuHeat account metadata available from OpenAPI v2."""
 
-    access_token: str
-    refresh_token: str | None = None
-    expires_at: datetime | None = None
-    token_type: str = "Bearer"
-    id_token: str | None = None
-
-    @property
-    def expired(self) -> bool:
-        if self.expires_at is None:
-            return False
-        return datetime.now(timezone.utc) + EXPIRY_SKEW >= self.expires_at
+    username: str
+    language: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Thermostat:
-    """Normalized thermostat state; temperatures are degrees Celsius."""
+    """Normalized thermostat state; every temperature is degrees Celsius."""
 
     serial_number: str
     name: str | None
@@ -74,222 +70,70 @@ class Thermostat:
 
     @property
     def room(self) -> str | None:
-        """Home Assistant's legacy integration calls the name ``room``."""
+        """Return the room name used by the legacy Home Assistant entity."""
         return self.name
 
 
-TokenUpdateCallback = Callable[[TokenSet], Awaitable[None] | None]
+AccessTokenProvider = Callable[[bool], Awaitable[str]]
 
 
 class NuHeatClient:
-    """OAuth2/OIDC-aware asynchronous NuHeat OpenAPI client.
+    """NuHeat API client with caller-owned HTTP and OAuth lifecycle.
 
-    Initial login uses Authorization Code with PKCE. A client secret is sent
-    only when one was issued by Chemelex for a confidential client. Password
-    grant and private/mobile application credentials are deliberately absent.
+    The access-token provider receives ``True`` only after the API returns one
+    HTTP 401. The provider must then refresh the token before returning it.
+    OAuth token storage and refresh-token rotation deliberately live outside
+    this library.
     """
 
     def __init__(
         self,
-        client_id: str,
-        redirect_uri: str,
+        session: ClientSession,
+        access_token_provider: AccessTokenProvider,
         *,
-        client_secret: str | None = None,
-        tokens: TokenSet | None = None,
-        http_client: httpx.AsyncClient | None = None,
-        token_update_callback: TokenUpdateCallback | None = None,
-        min_temperature: float | None = None,
-        max_temperature: float | None = None,
+        base_url: str = API_BASE_URL,
     ) -> None:
-        if not client_id or not redirect_uri:
-            raise ValueError("client_id and redirect_uri are required")
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.redirect_uri = redirect_uri
-        self.tokens = tokens
-        self._http = http_client or httpx.AsyncClient(timeout=20.0)
-        self._owns_http = http_client is None
-        self._token_update_callback = token_update_callback
-        self._discovery: dict[str, Any] | None = None
-        self._refresh_lock = asyncio.Lock()
-        self._code_verifier: str | None = None
-        self._state: str | None = None
-        self._min_temperature = min_temperature
-        self._max_temperature = max_temperature
+        self._session = session
+        self._access_token_provider = access_token_provider
+        self._base_url = base_url.rstrip("/")
 
-    @classmethod
-    def from_env(
-        cls, *, http_client: httpx.AsyncClient | None = None
-    ) -> NuHeatClient:
-        """Build from environment variables, optionally loading local .env."""
-        try:
-            from dotenv import load_dotenv
-        except ImportError:
-            pass
-        else:
-            load_dotenv()
-
-        refresh_token = os.getenv("NUHEAT_REFRESH_TOKEN") or None
-        tokens = TokenSet(access_token="", refresh_token=refresh_token) if refresh_token else None
-        return cls(
-            os.environ["NUHEAT_CLIENT_ID"],
-            os.environ["NUHEAT_REDIRECT_URI"],
-            client_secret=os.getenv("NUHEAT_CLIENT_SECRET") or None,
-            tokens=tokens,
-            http_client=http_client,
-        )
-
-    async def __aenter__(self) -> NuHeatClient:
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        await self.aclose()
-
-    async def aclose(self) -> None:
-        if self._owns_http:
-            await self._http.aclose()
-
-    async def _get_discovery(self) -> Mapping[str, Any]:
-        if self._discovery is None:
-            response = await self._http.get(DISCOVERY_URL)
-            self._raise_for_status(response, auth=True)
-            self._discovery = response.json()
-        return self._discovery
-
-    async def authorization_url(self) -> str:
-        """Create an OIDC authorization URL and retain PKCE/state locally."""
-        discovery = await self._get_discovery()
-        self._code_verifier = secrets.token_urlsafe(64)
-        digest = hashlib.sha256(self._code_verifier.encode()).digest()
-        challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-        self._state = secrets.token_urlsafe(32)
-        query = urlencode(
-            {
-                "client_id": self.client_id,
-                "redirect_uri": self.redirect_uri,
-                "response_type": "code",
-                "scope": " ".join(DEFAULT_SCOPES),
-                "state": self._state,
-                "code_challenge": challenge,
-                "code_challenge_method": "S256",
-            }
-        )
-        return f"{discovery['authorization_endpoint']}?{query}"
-
-    async def authenticate(
-        self, *, authorization_code: str | None = None, state: str | None = None
-    ) -> TokenSet:
-        """Exchange an authorization code, refresh, or validate current auth."""
-        if authorization_code is not None:
-            if not self._code_verifier:
-                raise NuHeatAuthError("call authorization_url() before exchanging a code")
-            if state is None or not secrets.compare_digest(state, self._state or ""):
-                raise NuHeatAuthError("OIDC state mismatch")
-            await self._exchange_token(
-                {
-                    "grant_type": "authorization_code",
-                    "code": authorization_code,
-                    "redirect_uri": self.redirect_uri,
-                    "code_verifier": self._code_verifier,
-                }
-            )
-        elif self.tokens and self.tokens.refresh_token and (
-            not self.tokens.access_token or self.tokens.expired
-        ):
-            await self._refresh_access_token()
-        elif not self.tokens or not self.tokens.access_token:
-            raise NuHeatAuthError(
-                "authorization required: call authorization_url(), then authenticate(code)"
-            )
-        return self.tokens
-
-    async def _refresh_access_token(self) -> None:
-        async with self._refresh_lock:
-            if self.tokens and self.tokens.access_token and not self.tokens.expired:
-                return
-            if not self.tokens or not self.tokens.refresh_token:
-                raise NuHeatAuthError("no refresh token available")
-            old_refresh_token = self.tokens.refresh_token
-            await self._exchange_token(
-                {"grant_type": "refresh_token", "refresh_token": old_refresh_token},
-                fallback_refresh_token=old_refresh_token,
-            )
-
-    async def _exchange_token(
-        self, data: dict[str, str], *, fallback_refresh_token: str | None = None
-    ) -> None:
-        discovery = await self._get_discovery()
-        data["client_id"] = self.client_id
-        if self.client_secret:
-            data["client_secret"] = self.client_secret
-        response = await self._http.post(discovery["token_endpoint"], data=data)
-        self._raise_for_status(response, auth=True)
-        payload = response.json()
-        now = datetime.now(timezone.utc)
-        self.tokens = TokenSet(
-            access_token=payload["access_token"],
-            refresh_token=payload.get("refresh_token", fallback_refresh_token),
-            expires_at=now + timedelta(seconds=int(payload.get("expires_in", 3600))),
-            token_type=payload.get("token_type", "Bearer"),
-            id_token=payload.get("id_token"),
-        )
-        if self._token_update_callback:
-            result = self._token_update_callback(self.tokens)
-            if result is not None:
-                await result
-
-    async def _access_token(self) -> str:
-        await self.authenticate()
-        assert self.tokens is not None
-        return self.tokens.access_token
-
-    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        token = await self._access_token()
-        headers = dict(kwargs.pop("headers", {}))
-        headers["Authorization"] = f"Bearer {token}"
-        headers.setdefault("Accept", "application/json")
-        response = await self._http.request(
-            method, f"{API_BASE_URL}{path}", headers=headers, **kwargs
-        )
-        if response.status_code == 401 and self.tokens and self.tokens.refresh_token:
-            self.tokens = replace(
-                self.tokens, expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)
-            )
-            await self._refresh_access_token()
-            headers["Authorization"] = f"Bearer {self.tokens.access_token}"
-            response = await self._http.request(
-                method, f"{API_BASE_URL}{path}", headers=headers, **kwargs
-            )
-        self._raise_for_status(response)
-        return response
-
-    @staticmethod
-    def _raise_for_status(response: httpx.Response, *, auth: bool = False) -> None:
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            try:
-                detail = json.dumps(response.json())
-            except (ValueError, TypeError):
-                detail = response.text
-            error = f"NuHeat returned HTTP {response.status_code}: {detail}"
-            raise (NuHeatAuthError(error) if auth else NuHeatApiError(error)) from exc
+    async def get_account(self) -> Account:
+        """Return account metadata used to identify a config entry."""
+        payload = await self._request_json("GET", "/api/v2/Account")
+        data = _mapping(payload, "account")
+        username = _required_string(data, "userName")
+        return Account(username=username, language=_optional_string(data, "language"))
 
     async def list_thermostats(self) -> list[Thermostat]:
-        response = await self._request("GET", "/api/v2/Thermostat")
-        return [self._parse_thermostat(item) for item in response.json()]
+        """Return all thermostats currently visible to the account."""
+        payload = await self._request_json("GET", "/api/v2/Thermostat")
+        if not isinstance(payload, list):
+            raise NuHeatDataError("NuHeat thermostat response was not a list")
+        return [parse_thermostat(item) for item in payload]
 
     async def get_thermostat(self, serial_number: str) -> Thermostat:
-        serial = _path_serial(serial_number)
-        response = await self._request("GET", f"/api/v2/Thermostat/{serial}")
-        return self._parse_thermostat(response.json())
+        """Return one thermostat by serial number."""
+        serial = _serial_path(serial_number)
+        payload = await self._request_json("GET", f"/api/v2/Thermostat/{serial}")
+        return parse_thermostat(payload)
 
     async def set_target_temperature(
-        self, serial_number: str, temperature: float
+        self,
+        serial_number: str,
+        temperature: float,
+        *,
+        mode: ScheduleMode,
     ) -> Thermostat:
-        """Set a permanent manual target in degrees Celsius."""
-        await self.set_schedule_mode(serial_number, ScheduleMode.MANUAL, temperature=temperature)
-        return await self.get_thermostat(serial_number)
+        """Set a Celsius target using an explicit, caller-selected mode.
+
+        NuHeat's target-setpoint semantics remain subject to live validation,
+        so this method intentionally has no implicit Hold/Manual default.
+        """
+        if mode is ScheduleMode.AUTO:
+            raise ValueError("a target temperature requires Hold or Manual mode")
+        return await self.set_schedule_mode(
+            serial_number, mode, temperature=temperature
+        )
 
     async def set_schedule_mode(
         self,
@@ -299,58 +143,173 @@ class NuHeatClient:
         temperature: float | None = None,
         hold_until: datetime | None = None,
         temperature_type: int = 0,
-    ) -> None:
-        """Set Auto, temporary Hold, or Manual mode via documented v2 endpoints."""
-        mode = ScheduleMode(mode)
-        payload: dict[str, Any] = {"serialNumber": serial_number}
-        if mode is not ScheduleMode.AUTO:
+    ) -> Thermostat:
+        """Send a documented Auto, Hold, or Manual mode command."""
+        schedule_mode = ScheduleMode(mode)
+        payload: dict[str, Any] = {"serialNumber": _serial_value(serial_number)}
+        if schedule_mode is not ScheduleMode.AUTO:
             if temperature is not None:
-                payload["temperature"] = _celsius_to_api(temperature)
+                payload["temperature"] = encode_temperature(temperature)
             payload["temperatureType"] = temperature_type
-        if mode is ScheduleMode.HOLD and hold_until is not None:
+        if schedule_mode is ScheduleMode.HOLD and hold_until is not None:
             if hold_until.tzinfo is None:
                 raise ValueError("hold_until must be timezone-aware")
-            payload["holdUntil"] = hold_until.astimezone(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
+            payload["holdUntil"] = (
+                hold_until.astimezone(UTC).isoformat().replace("+00:00", "Z")
             )
-        await self._request("PUT", f"/api/v2/Mode/{mode.value.title()}", json=payload)
-
-    def _parse_thermostat(self, data: Mapping[str, Any]) -> Thermostat:
-        return Thermostat(
-            serial_number=str(data["serialNumber"]),
-            name=data.get("name"),
-            current_temperature=_api_to_celsius(data["currentTemperature"]),
-            target_temperature=_api_to_celsius(data["setPointTemperature"]),
-            heating=bool(data["isHeating"]),
-            online=bool(data["online"]),
-            mode=int(data["mode"]),
-            hold_until=_parse_datetime(data.get("holdUntil")),
-            error_state=data.get("errorState"),
-            min_temperature=_optional_api_temperature(data.get("minTemperature"), self._min_temperature),
-            max_temperature=_optional_api_temperature(data.get("maxTemperature"), self._max_temperature),
+        await self._request(
+            "PUT", f"/api/v2/Mode/{schedule_mode.value.title()}", json=payload
         )
+        return await self.get_thermostat(serial_number)
+
+    async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+        response = await self._request(method, path, **kwargs)
+        try:
+            return await response.json()
+        except (ContentTypeError, ClientError, ValueError, TypeError) as err:
+            raise NuHeatDataError("NuHeat returned invalid JSON") from err
+        finally:
+            response.release()
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> ClientResponse:
+        response: ClientResponse | None = None
+        for attempt in range(2):
+            try:
+                token = await self._access_token_provider(attempt == 1)
+                response = await self._session.request(
+                    method,
+                    f"{self._base_url}{path}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json",
+                    },
+                    **kwargs,
+                )
+            except (TimeoutError, ClientError) as err:
+                raise NuHeatApiError("Unable to communicate with NuHeat") from err
+
+            if response.status != HTTPStatus.UNAUTHORIZED:
+                break
+            response.release()
+
+        if response is None:  # pragma: no cover - defensive type narrowing
+            raise NuHeatApiError("NuHeat request did not return a response")
+        if response.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+            response.release()
+            raise NuHeatAuthError("NuHeat authorization was rejected")
+        if response.status == HTTPStatus.TOO_MANY_REQUESTS or response.status >= 500:
+            status = response.status
+            response.release()
+            raise NuHeatApiError(
+                f"NuHeat service temporarily failed with HTTP {status}"
+            )
+        if response.status >= HTTPStatus.BAD_REQUEST:
+            status = response.status
+            response.release()
+            raise NuHeatDataError(f"NuHeat API rejected the request with HTTP {status}")
+        return response
 
 
-def _celsius_to_api(value: float) -> int:
-    """OpenAPI temperature integers are hundredths of a degree Celsius."""
-    return round(value * 100)
+def parse_thermostat(value: Any) -> Thermostat:
+    """Parse one documented thermostat object into the public model."""
+    data = _mapping(value, "thermostat")
+    return Thermostat(
+        serial_number=_required_string(data, "serialNumber"),
+        name=_optional_string(data, "name"),
+        current_temperature=decode_temperature(data.get("currentTemperature")),
+        target_temperature=decode_temperature(data.get("setPointTemperature")),
+        heating=_required_bool(data, "isHeating"),
+        online=_required_bool(data, "online"),
+        mode=_required_int(data, "mode"),
+        hold_until=_parse_datetime(data.get("holdUntil")),
+        error_state=_optional_string(data, "errorState"),
+        min_temperature=_optional_temperature(data.get("minTemperature")),
+        max_temperature=_optional_temperature(data.get("maxTemperature")),
+    )
 
 
-def _api_to_celsius(value: int) -> float:
-    return int(value) / 100.0
+def encode_temperature(value: float) -> int:
+    """Encode Celsius as the API's integer centi-Celsius representation."""
+    temperature = _valid_temperature(value)
+    return round(temperature * 100)
 
 
-def _optional_api_temperature(value: Any, fallback: float | None) -> float | None:
-    return fallback if value is None else _api_to_celsius(value)
+def decode_temperature(value: Any) -> float:
+    """Decode the API's integer centi-Celsius representation."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise NuHeatDataError("NuHeat returned an invalid temperature")
+    return _valid_temperature(float(value) / 100.0)
 
 
-def _parse_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def _path_serial(value: str) -> str:
-    if not value or any(char in value for char in "/?#"):
-        raise ValueError("invalid serial number")
+def _valid_temperature(value: float) -> float:
+    if not math.isfinite(value) or not -100.0 <= value <= 100.0:
+        raise NuHeatDataError("NuHeat returned an invalid temperature")
     return value
+
+
+def _optional_temperature(value: Any) -> float | None:
+    return None if value is None else decode_temperature(value)
+
+
+def _mapping(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise NuHeatDataError(f"NuHeat {name} response was not an object")
+    return value
+
+
+def _required_string(data: Mapping[str, Any], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise NuHeatDataError(f"NuHeat response omitted required field {key}")
+    return value.strip()
+
+
+def _optional_string(data: Mapping[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise NuHeatDataError(f"NuHeat response contained invalid field {key}")
+    return value
+
+
+def _required_bool(data: Mapping[str, Any], key: str) -> bool:
+    value = data.get(key)
+    if not isinstance(value, bool):
+        raise NuHeatDataError(f"NuHeat response omitted required field {key}")
+    return value
+
+
+def _required_int(data: Mapping[str, Any], key: str) -> int:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise NuHeatDataError(f"NuHeat response omitted required field {key}")
+    return value
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise NuHeatDataError("NuHeat returned an invalid hold timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as err:
+        raise NuHeatDataError("NuHeat returned an invalid hold timestamp") from err
+    if parsed.tzinfo is None:
+        raise NuHeatDataError("NuHeat returned an invalid hold timestamp")
+    return parsed
+
+
+def _serial_value(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or any(char in value for char in "/?#")
+    ):
+        raise ValueError("invalid thermostat serial number")
+    return value.strip()
+
+
+def _serial_path(value: str) -> str:
+    return quote(_serial_value(value), safe="")

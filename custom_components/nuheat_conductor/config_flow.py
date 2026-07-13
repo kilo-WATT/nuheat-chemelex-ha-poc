@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import logging
+from collections.abc import Mapping
 from typing import Any, override
 
-from aiohttp import ClientError
 import voluptuous as vol
-
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlowResult
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_TOKEN
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import NuHeatApi, NuHeatApiError, NuHeatAuthError
+from chemelex_nuheat import (
+    NuHeatApiError,
+    NuHeatAuthError,
+    NuHeatClient,
+    NuHeatDataError,
+)
+
 from .const import DOMAIN, OAUTH_SCOPES
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,20 +56,18 @@ class NuHeatConductorConfigFlow(
         return {"scope": " ".join(OAUTH_SCOPES)}
 
     @override
-    async def async_oauth_create_entry(
-        self, data: dict[str, Any]
-    ) -> ConfigFlowResult:
+    async def async_oauth_create_entry(self, data: dict[str, Any]) -> ConfigFlowResult:
         token = data[CONF_TOKEN]
 
         async def async_access_token(force_refresh: bool) -> str:
             return token[CONF_ACCESS_TOKEN]
 
-        api = NuHeatApi(async_get_clientsession(self.hass), async_access_token)
+        api = NuHeatClient(async_get_clientsession(self.hass), async_access_token)
         try:
             account = await api.get_account()
         except NuHeatAuthError:
             return self.async_abort(reason="invalid_auth")
-        except (NuHeatApiError, ClientError):
+        except (NuHeatApiError, NuHeatDataError):
             return self.async_abort(reason="cannot_connect")
 
         unique_id = account.username.casefold()

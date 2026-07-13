@@ -1,17 +1,23 @@
-from datetime import datetime, timedelta, timezone
-import json
-from urllib.parse import parse_qs, urlparse
+"""Mocked tests for the Home Assistant-independent NuHeat client."""
 
-import httpx
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+
 import pytest
+from aiohttp import ClientConnectionError
 
-from chemelex_nuheat import NuHeatAuthError, NuHeatClient, ScheduleMode, TokenSet
-from chemelex_nuheat.client import API_BASE_URL, DISCOVERY_URL
-
-DISCOVERY = {
-    "authorization_endpoint": "https://identity.mynuheat.com/connect/authorize",
-    "token_endpoint": "https://identity.mynuheat.com/connect/token",
-}
+from chemelex_nuheat import (
+    NuHeatApiError,
+    NuHeatAuthError,
+    NuHeatClient,
+    NuHeatDataError,
+    ScheduleMode,
+    decode_temperature,
+    encode_temperature,
+)
 
 THERMOSTAT = {
     "serialNumber": "ABC123",
@@ -26,176 +32,223 @@ THERMOSTAT = {
 }
 
 
-def make_client(handler, *, tokens=None, callback=None):
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = NuHeatClient(
-        "issued-client-id",
-        "http://127.0.0.1:8765/callback",
-        tokens=tokens,
-        http_client=http,
-        token_update_callback=callback,
-    )
-    return client, http
+class FakeResponse:
+    """Minimal aiohttp response double."""
+
+    def __init__(
+        self,
+        status: int,
+        payload: Any = None,
+        *,
+        json_error: Exception | None = None,
+    ) -> None:
+        self.status = status
+        self.payload = payload
+        self.json_error = json_error
+        self.released = False
+
+    async def json(self) -> Any:
+        if self.json_error is not None:
+            raise self.json_error
+        return self.payload
+
+    def release(self) -> None:
+        self.released = True
+
+
+class FakeSession:
+    """Record requests and return mocked responses or failures."""
+
+    def __init__(
+        self,
+        *results: FakeResponse | Exception | Callable[..., FakeResponse],
+    ) -> None:
+        self.results = list(results)
+        self.requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+        self.requests.append((method, url, kwargs))
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        if callable(result):
+            return result(method, url, kwargs)
+        return result
+
+
+def make_client(
+    *results: FakeResponse | Exception | Callable[..., FakeResponse],
+    tokens: list[str] | None = None,
+) -> tuple[NuHeatClient, FakeSession, list[bool]]:
+    session = FakeSession(*results)
+    refreshes: list[bool] = []
+    token_values = iter(tokens or ["access-token"] * max(1, len(results)))
+
+    async def access_token(force_refresh: bool) -> str:
+        refreshes.append(force_refresh)
+        return next(token_values)
+
+    return NuHeatClient(session, access_token), session, refreshes  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
-async def test_authorization_code_with_pkce_and_exchange():
-    requests = []
-
-    def handler(request):
-        requests.append(request)
-        if str(request.url) == DISCOVERY_URL:
-            return httpx.Response(200, json=DISCOVERY)
-        form = parse_qs(request.content.decode())
-        assert form["grant_type"] == ["authorization_code"]
-        assert form["code"] == ["the-code"]
-        assert form["code_verifier"][0]
-        assert "client_secret" not in form
-        return httpx.Response(
-            200,
-            json={
-                "access_token": "access-1",
-                "refresh_token": "refresh-1",
-                "expires_in": 3600,
-            },
-        )
-
-    client, http = make_client(handler)
-    url = await client.authorization_url()
-    query = parse_qs(urlparse(url).query)
-    assert query["scope"] == ["openid openapi offline_access"]
-    assert query["code_challenge_method"] == ["S256"]
-    tokens = await client.authenticate(authorization_code="the-code", state=query["state"][0])
-    assert tokens.access_token == "access-1"
-    assert tokens.refresh_token == "refresh-1"
-    await http.aclose()
-
-
-@pytest.mark.asyncio
-async def test_authorization_code_rejects_missing_state():
-    def handler(request):
-        assert str(request.url) == DISCOVERY_URL
-        return httpx.Response(200, json=DISCOVERY)
-
-    client, http = make_client(handler)
-    await client.authorization_url()
-    with pytest.raises(NuHeatAuthError, match="state mismatch"):
-        await client.authenticate(authorization_code="the-code")
-    await http.aclose()
-
-
-@pytest.mark.asyncio
-async def test_refresh_rotates_token_and_lists_thermostats():
-    saved = []
-    expired = TokenSet(
-        "expired",
-        "refresh-old",
-        datetime.now(timezone.utc) - timedelta(seconds=1),
+async def test_list_and_get_thermostats_parse_centi_celsius() -> None:
+    client, session, _ = make_client(
+        FakeResponse(200, [THERMOSTAT]), FakeResponse(200, THERMOSTAT)
     )
 
-    def handler(request):
-        if str(request.url) == DISCOVERY_URL:
-            return httpx.Response(200, json=DISCOVERY)
-        if request.url.path == "/connect/token":
-            form = parse_qs(request.content.decode())
-            assert form["refresh_token"] == ["refresh-old"]
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": "fresh",
-                    "refresh_token": "refresh-new",
-                    "expires_in": 3600,
-                },
-            )
-        assert request.headers["Authorization"] == "Bearer fresh"
-        return httpx.Response(200, json=[THERMOSTAT])
-
-    client, http = make_client(handler, tokens=expired, callback=saved.append)
     thermostats = await client.list_thermostats()
-    assert thermostats[0].room == "Bathroom"
-    assert thermostats[0].current_temperature == 21.5
-    assert thermostats[0].target_temperature == 23.0
-    assert thermostats[0].heating is True
-    assert thermostats[0].min_temperature is None
-    assert saved[0].refresh_token == "refresh-new"
-    await http.aclose()
-
-
-@pytest.mark.asyncio
-async def test_401_refreshes_once_and_retries():
-    api_calls = 0
-    tokens = TokenSet("stale", "refresh", datetime.now(timezone.utc) + timedelta(hours=1))
-
-    def handler(request):
-        nonlocal api_calls
-        if str(request.url) == DISCOVERY_URL:
-            return httpx.Response(200, json=DISCOVERY)
-        if request.url.path == "/connect/token":
-            return httpx.Response(200, json={"access_token": "fresh", "expires_in": 3600})
-        api_calls += 1
-        if api_calls == 1:
-            return httpx.Response(401)
-        assert request.headers["Authorization"] == "Bearer fresh"
-        return httpx.Response(200, json=THERMOSTAT)
-
-    client, http = make_client(handler, tokens=tokens)
     thermostat = await client.get_thermostat("ABC123")
-    assert thermostat.online is True
-    assert api_calls == 2
-    await http.aclose()
+
+    assert thermostats == [thermostat]
+    assert thermostat.current_temperature == 21.5
+    assert thermostat.target_temperature == 23.0
+    assert thermostat.room == "Bathroom"
+    assert session.requests[1][1].endswith("/api/v2/Thermostat/ABC123")
 
 
 @pytest.mark.asyncio
-async def test_set_target_temperature_uses_manual_mode_then_refreshes():
-    calls = []
-    tokens = TokenSet("valid", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
-
-    def handler(request):
-        calls.append(request)
-        if request.method == "PUT":
-            assert request.url == f"{API_BASE_URL}/api/v2/Mode/Manual"
-            assert json.loads(request.content) == {
-                "serialNumber": "ABC123",
-                "temperature": 2250,
-                "temperatureType": 0,
-            }
-            return httpx.Response(204)
-        return httpx.Response(200, json=THERMOSTAT)
-
-    client, http = make_client(handler, tokens=tokens)
-    result = await client.set_target_temperature("ABC123", 22.5)
-    assert result.serial_number == "ABC123"
-    assert [request.method for request in calls] == ["PUT", "GET"]
-    await http.aclose()
+async def test_get_account() -> None:
+    client, _, _ = make_client(
+        FakeResponse(200, {"userName": "Owner@Example.com", "language": "en"})
+    )
+    account = await client.get_account()
+    assert account.username == "Owner@Example.com"
+    assert account.language == "en"
 
 
 @pytest.mark.asyncio
-async def test_auto_and_hold_payloads():
-    payloads = []
-    tokens = TokenSet("valid", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+async def test_setpoint_requires_explicit_mode_and_encodes_centi_celsius() -> None:
+    client, session, _ = make_client(
+        FakeResponse(204), FakeResponse(200, {**THERMOSTAT, "mode": 3})
+    )
 
-    def handler(request):
-        payloads.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(204)
+    thermostat = await client.set_target_temperature(
+        "ABC123", 22.5, mode=ScheduleMode.MANUAL
+    )
 
-    client, http = make_client(handler, tokens=tokens)
+    assert thermostat.mode == 3
+    assert session.requests[0][0] == "PUT"
+    assert session.requests[0][1].endswith("/api/v2/Mode/Manual")
+    assert session.requests[0][2]["json"] == {
+        "serialNumber": "ABC123",
+        "temperature": 2250,
+        "temperatureType": 0,
+    }
+    with pytest.raises(ValueError, match="requires Hold or Manual"):
+        await client.set_target_temperature("ABC123", 22.5, mode=ScheduleMode.AUTO)
+
+
+@pytest.mark.asyncio
+async def test_auto_and_hold_payloads() -> None:
+    client, session, _ = make_client(
+        FakeResponse(204),
+        FakeResponse(200, {**THERMOSTAT, "mode": 1}),
+        FakeResponse(204),
+        FakeResponse(200, THERMOSTAT),
+    )
     await client.set_schedule_mode("ABC123", ScheduleMode.AUTO)
     await client.set_schedule_mode(
         "ABC123",
         ScheduleMode.HOLD,
-        temperature=24,
-        hold_until=datetime(2026, 7, 8, 1, tzinfo=timezone.utc),
+        temperature=24.0,
+        hold_until=datetime(2026, 7, 8, 1, tzinfo=UTC),
     )
-    assert payloads == [
-        ("/api/v2/Mode/Auto", {"serialNumber": "ABC123"}),
-        (
-            "/api/v2/Mode/Hold",
-            {
-                "serialNumber": "ABC123",
-                "temperature": 2400,
-                "temperatureType": 0,
-                "holdUntil": "2026-07-08T01:00:00Z",
-            },
-        ),
-    ]
-    await http.aclose()
+    assert session.requests[0][2]["json"] == {"serialNumber": "ABC123"}
+    assert session.requests[2][2]["json"] == {
+        "serialNumber": "ABC123",
+        "temperature": 2400,
+        "temperatureType": 0,
+        "holdUntil": "2026-07-08T01:00:00Z",
+    }
+
+
+@pytest.mark.asyncio
+async def test_401_forces_one_refresh_and_retries_once() -> None:
+    client, session, refreshes = make_client(
+        FakeResponse(401), FakeResponse(200, THERMOSTAT), tokens=["old", "new"]
+    )
+    await client.get_thermostat("ABC123")
+    assert refreshes == [False, True]
+    assert session.requests[0][2]["headers"]["Authorization"] == "Bearer old"
+    assert session.requests[1][2]["headers"]["Authorization"] == "Bearer new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("statuses", [(401, 401), (403,)])
+async def test_rejected_authorization(statuses: tuple[int, ...]) -> None:
+    client, _, _ = make_client(*(FakeResponse(status) for status in statuses))
+    with pytest.raises(NuHeatAuthError, match="authorization was rejected"):
+        await client.get_thermostat("ABC123")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500, 503])
+async def test_retryable_http_errors(status: int) -> None:
+    client, _, _ = make_client(FakeResponse(status))
+    with pytest.raises(NuHeatApiError, match=str(status)):
+        await client.list_thermostats()
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_is_sanitized() -> None:
+    client, _, _ = make_client(
+        FakeResponse(200, json_error=ValueError("body contained private material"))
+    )
+    with pytest.raises(NuHeatDataError, match="invalid JSON") as raised:
+        await client.list_thermostats()
+    assert "private material" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {key: value for key, value in THERMOSTAT.items() if key != "serialNumber"},
+        {**THERMOSTAT, "currentTemperature": "warm"},
+        {**THERMOSTAT, "setPointTemperature": float("nan")},
+        {**THERMOSTAT, "online": "yes"},
+    ],
+)
+async def test_invalid_thermostat_data(payload: dict[str, Any]) -> None:
+    client, _, _ = make_client(FakeResponse(200, [payload]))
+    with pytest.raises(NuHeatDataError):
+        await client.list_thermostats()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [TimeoutError(), ClientConnectionError()])
+async def test_network_failures_are_retryable(failure: Exception) -> None:
+    client, _, _ = make_client(failure)
+    with pytest.raises(NuHeatApiError, match="Unable to communicate"):
+        await client.list_thermostats()
+
+
+def test_temperature_codec_rejects_invalid_values() -> None:
+    assert encode_temperature(21.125) == 2112
+    assert decode_temperature(2112) == 21.12
+    for value in (float("nan"), float("inf"), 101.0):
+        with pytest.raises(NuHeatDataError):
+            encode_temperature(value)
+
+
+@pytest.mark.asyncio
+async def test_secrets_and_response_bodies_never_reach_errors_or_logs(caplog) -> None:
+    secret_values = (
+        "access-token-secret",
+        "refresh-token-secret",
+        "authorization-code-secret",
+        "client-secret-value",
+        "complete-response-body-secret",
+    )
+    session = FakeSession(FakeResponse(500, payload=secret_values[-1]))
+
+    async def access_token(force_refresh: bool) -> str:
+        return secret_values[0]
+
+    client = NuHeatClient(session, access_token)  # type: ignore[arg-type]
+    with pytest.raises(NuHeatApiError) as raised:
+        await client.list_thermostats()
+
+    output = f"{raised.value}\n{caplog.text}"
+    assert all(secret not in output for secret in secret_values)

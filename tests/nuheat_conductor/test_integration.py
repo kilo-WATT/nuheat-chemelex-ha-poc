@@ -2,68 +2,97 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
-from pathlib import Path
 import time
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
-from homeassistant.components.climate import ClimateEntityFeature
 from homeassistant.components.application_credentials import ClientCredential
+from homeassistant.components.climate import ClimateEntityFeature
 from homeassistant.components.climate.const import (
-    DEFAULT_MAX_TEMP,
-    DEFAULT_MIN_TEMP,
+    ATTR_CURRENT_TEMPERATURE,
     HVACAction,
     HVACMode,
 )
-from homeassistant.config_entries import ConfigEntryState, SOURCE_USER
-from homeassistant.const import CONF_ACCESS_TOKEN, CONF_TOKEN
-from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.helpers import config_entry_oauth2_flow
-from homeassistant.helpers.config_entry_oauth2_flow import AbstractOAuth2Implementation
+from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER, ConfigEntryState
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    CONF_ACCESS_TOKEN,
+    CONF_TOKEN,
+    UnitOfTemperature,
+)
+from homeassistant.data_entry_flow import AbortFlow, FlowResultType
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    AbstractOAuth2Implementation,
+    LocalOAuth2ImplementationWithPkce,
+    OAuth2TokenRequestReauthError,
+    OAuth2TokenRequestTransientError,
+)
+from homeassistant.util.unit_system import IMPERIAL_SYSTEM
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from chemelex_nuheat import (
+    Account,
+    NuHeatApiError,
+    NuHeatAuthError,
+    ScheduleMode,
+    Thermostat,
+    ThermostatMode,
+)
 from custom_components.nuheat_conductor import async_setup_entry
 from custom_components.nuheat_conductor.application_credentials import (
     async_get_auth_implementation,
 )
-from custom_components.nuheat_conductor.api import (
-    Account,
-    NuHeatAuthError,
-    ScheduleMode,
-    Thermostat,
+from custom_components.nuheat_conductor.behavior import (
+    api_mode_for_preset,
+    preset_for_api_mode,
+    setpoint_command_mode,
 )
-from custom_components.nuheat_conductor.climate import NuHeatClimateEntity
+from custom_components.nuheat_conductor.climate import (
+    NuHeatClimateEntity,
+)
+from custom_components.nuheat_conductor.climate import (
+    async_setup_entry as async_setup_climate,
+)
 from custom_components.nuheat_conductor.config_flow import NuHeatConductorConfigFlow
-from custom_components.nuheat_conductor.const import DOMAIN, MODE_AUTO, MODE_HOLD, MODE_MANUAL
+from custom_components.nuheat_conductor.const import DOMAIN
 from custom_components.nuheat_conductor.coordinator import NuHeatCoordinator
-from custom_components.nuheat_conductor.oauth import NuHeatLocalOAuth2Implementation
 
 
-def thermostat(*, mode: int = MODE_AUTO, heating: bool = True) -> Thermostat:
+def thermostat(
+    serial: str = "ABC123",
+    *,
+    mode: int = ThermostatMode.AUTO,
+    heating: bool = True,
+    online: bool = True,
+) -> Thermostat:
+    """Return a normalized API model for integration tests."""
     return Thermostat(
-        serial_number="ABC123",
-        name="Bathroom",
+        serial_number=serial,
+        name="Bathroom" if serial == "ABC123" else "Kitchen",
         current_temperature=21.5,
         target_temperature=23.0,
         heating=heating,
-        online=True,
+        online=online,
         mode=mode,
-        hold_until=datetime(2026, 7, 8, 1, tzinfo=timezone.utc),
+        hold_until=datetime(2026, 7, 8, 1, tzinfo=UTC),
     )
 
 
 class FakeOAuthImplementation(AbstractOAuth2Implementation):
-    """Minimal OAuth provider used by config-flow and refresh tests."""
+    """Minimal local/cloud OAuth provider for flow and refresh tests."""
 
-    def __init__(self, *, token: dict | None = None) -> None:
+    def __init__(self, *, token: dict | None = None, domain: str = "test") -> None:
         self._token = token or {
             "access_token": "access",
             "refresh_token": "refresh",
             "expires_in": 3600,
         }
+        self._domain = domain
 
     @property
     def name(self) -> str:
@@ -71,7 +100,7 @@ class FakeOAuthImplementation(AbstractOAuth2Implementation):
 
     @property
     def domain(self) -> str:
-        return "test"
+        return self._domain
 
     async def async_generate_authorize_url(self, flow_id: str) -> str:
         return "https://identity.example/authorize"
@@ -88,38 +117,55 @@ class FakeOAuthImplementation(AbstractOAuth2Implementation):
         }
 
 
+def oauth_data(access_token: str = "not-logged") -> dict:
+    return {
+        "auth_implementation": "test",
+        CONF_TOKEN: {CONF_ACCESS_TOKEN: access_token},
+    }
+
+
+def config_flow(hass, *, source: str = SOURCE_USER) -> NuHeatConductorConfigFlow:
+    flow = NuHeatConductorConfigFlow()
+    flow.hass = hass
+    flow.handler = DOMAIN
+    flow.context = {"source": source}
+    return flow
+
+
+async def coordinator_with(hass, *thermostats: Thermostat):
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.SETUP_IN_PROGRESS)
+    api = AsyncMock()
+    api.list_thermostats.return_value = list(thermostats)
+    coordinator = NuHeatCoordinator(hass, entry, api)
+    await coordinator.async_config_entry_first_refresh()
+    return coordinator, api, entry
+
+
 @pytest.mark.asyncio
-async def test_local_application_credentials_path(hass):
-    """Local credentials create the development PKCE implementation."""
+@pytest.mark.parametrize("client_secret", ["issued-client-secret", ""])
+async def test_local_application_credentials_path(hass, client_secret) -> None:
     implementation = await async_get_auth_implementation(
         hass,
         "local-test",
-        ClientCredential("issued-client-id", "issued-client-secret"),
+        ClientCredential("issued-client-id", client_secret),
     )
-
-    assert isinstance(implementation, NuHeatLocalOAuth2Implementation)
+    assert isinstance(implementation, LocalOAuth2ImplementationWithPkce)
     assert implementation.domain == "local-test"
     assert implementation.client_id == "issued-client-id"
-    assert implementation.extra_authorize_data["scope"] == (
-        "openid openapi offline_access"
-    )
     assert implementation.extra_authorize_data["code_challenge_method"] == "S256"
-    assert implementation.extra_token_resolve_data["code_verifier"]
+    assert len(implementation.extra_token_resolve_data["code_verifier"]) == 128
 
 
 @pytest.mark.asyncio
-async def test_missing_credentials_has_helpful_error(hass):
-    """Development builds explain how the missing provider will be solved."""
-    flow = NuHeatConductorConfigFlow()
-    flow.hass = hass
-    flow.context = {"source": SOURCE_USER}
-
+async def test_missing_credentials_has_helpful_error(hass) -> None:
+    flow = config_flow(hass)
     with patch(
         "homeassistant.helpers.config_entry_oauth2_flow.async_get_implementations",
         AsyncMock(return_value={}),
     ):
         result = await flow.async_step_user()
-
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "missing_oauth_credentials"
     strings = json.loads(
@@ -133,169 +179,228 @@ async def test_missing_credentials_has_helpful_error(hass):
 
 
 @pytest.mark.asyncio
-async def test_config_flow_accepts_future_cloud_oauth_implementation(hass):
-    """The normal flow consumes an abstract cloud provider without credentials."""
-    cloud = FakeOAuthImplementation()
-    flow = NuHeatConductorConfigFlow()
-    flow.hass = hass
-    flow.context = {"source": SOURCE_USER}
+async def test_config_flow_accepts_future_cloud_implementation(hass) -> None:
+    cloud = FakeOAuthImplementation(domain="cloud")
+    flow = config_flow(hass)
     flow.flow_id = "cloud-test-flow"
-
     with patch(
         "homeassistant.helpers.config_entry_oauth2_flow.async_get_implementations",
         AsyncMock(return_value={"cloud": cloud}),
     ):
         result = await flow.async_step_user()
-        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "pick_implementation"
-
         result = await flow.async_step_user({"implementation": "cloud"})
-
     assert result["type"] is FlowResultType.EXTERNAL_STEP
     assert result["url"].startswith("https://identity.example/authorize")
     assert flow.flow_impl is cloud
 
-@pytest.mark.asyncio
-async def test_config_flow_happy_path(hass):
-    """OAuth completion creates an account-keyed config entry."""
-    flow = NuHeatConductorConfigFlow()
-    flow.hass = hass
-    flow.context = {"source": SOURCE_USER}
 
-    data = {
-        "auth_implementation": "test",
-        CONF_TOKEN: {CONF_ACCESS_TOKEN: "not-logged"},
-    }
+@pytest.mark.asyncio
+async def test_successful_oauth_setup(hass) -> None:
+    flow = config_flow(hass)
+    data = oauth_data()
     with (
+        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
         patch(
-            "custom_components.nuheat_conductor.config_flow.async_get_clientsession"
-        ),
-        patch(
-            "custom_components.nuheat_conductor.config_flow.NuHeatApi.get_account",
+            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Owner@Example.com")),
         ),
     ):
         result = await flow.async_oauth_create_entry(data)
-
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Owner@Example.com"
     assert result["data"] == data
+    assert flow.unique_id == "owner@example.com"
 
 
 @pytest.mark.asyncio
-async def test_config_flow_auth_failure(hass):
-    """A rejected account lookup aborts without creating an entry."""
-    flow = NuHeatConductorConfigFlow()
-    flow.hass = hass
-    flow.context = {"source": SOURCE_USER}
-
+async def test_duplicate_account_is_prevented(hass) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=oauth_data(), unique_id="owner@example.com"
+    )
+    entry.add_to_hass(hass)
+    flow = config_flow(hass)
     with (
+        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
         patch(
-            "custom_components.nuheat_conductor.config_flow.async_get_clientsession"
-        ),
-        patch(
-            "custom_components.nuheat_conductor.config_flow.NuHeatApi.get_account",
-            AsyncMock(side_effect=NuHeatAuthError("rejected")),
+            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            AsyncMock(return_value=Account("Owner@Example.com")),
         ),
     ):
-        result = await flow.async_oauth_create_entry(
-            {
-                "auth_implementation": "test",
-                CONF_TOKEN: {CONF_ACCESS_TOKEN: "not-logged"},
-            }
-        )
-
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "invalid_auth"
+        with pytest.raises(AbortFlow, match="already_configured"):
+            await flow.async_oauth_create_entry(oauth_data())
 
 
 @pytest.mark.asyncio
-async def test_coordinator_first_refresh(hass):
-    """The first refresh indexes every thermostat by serial number."""
-    entry = MockConfigEntry(domain=DOMAIN, data={})
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (NuHeatAuthError("rejected"), "invalid_auth"),
+        (NuHeatApiError("down"), "cannot_connect"),
+    ],
+)
+async def test_account_lookup_failures(hass, error, reason, caplog) -> None:
+    flow = config_flow(hass)
+    secret = "access-token-must-not-be-logged"
+    with (
+        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
+        patch(
+            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            AsyncMock(side_effect=error),
+        ),
+    ):
+        result = await flow.async_oauth_create_entry(oauth_data(secret))
+    assert result["reason"] == reason
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_successful_reauthentication(hass) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=oauth_data("old-access"),
+        unique_id="owner@example.com",
+        title="Owner@Example.com",
+    )
     entry.add_to_hass(hass)
-    api = AsyncMock()
-    api.list_thermostats.return_value = [thermostat()]
-    coordinator = NuHeatCoordinator(hass, entry, api)
-    entry.mock_state(hass, ConfigEntryState.SETUP_IN_PROGRESS)
+    flow = config_flow(hass, source=SOURCE_REAUTH)
+    flow.context["entry_id"] = entry.entry_id
+    with (
+        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
+        patch(
+            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            AsyncMock(return_value=Account("Owner@Example.com")),
+        ),
+    ):
+        result = await flow.async_oauth_create_entry(oauth_data("new-access"))
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN] == "new-access"
 
-    await coordinator.async_config_entry_first_refresh()
 
-    assert coordinator.data == {"ABC123": thermostat()}
+@pytest.mark.asyncio
+async def test_reauthentication_rejects_wrong_account(hass) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=oauth_data("old-access"),
+        unique_id="owner@example.com",
+    )
+    entry.add_to_hass(hass)
+    flow = config_flow(hass, source=SOURCE_REAUTH)
+    flow.context["entry_id"] = entry.entry_id
+    with (
+        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
+        patch(
+            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            AsyncMock(return_value=Account("Different@Example.com")),
+        ),
+    ):
+        with pytest.raises(AbortFlow, match="reauth_account_mismatch"):
+            await flow.async_oauth_create_entry(oauth_data("wrong-account"))
+    assert entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN] == "old-access"
+
+
+@pytest.mark.asyncio
+async def test_coordinator_first_refresh_and_offline_availability(hass) -> None:
+    coordinator, api, _ = await coordinator_with(
+        hass, thermostat(), thermostat("XYZ789", online=False)
+    )
+    assert set(coordinator.data) == {"ABC123", "XYZ789"}
+    assert coordinator.is_thermostat_available("ABC123") is True
+    assert coordinator.is_thermostat_available("XYZ789") is False
     api.list_thermostats.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
-async def test_climate_entity_properties_and_defaults(hass):
-    """Entity state mirrors the API and uses HA-only fallback limits."""
-    entry = MockConfigEntry(domain=DOMAIN, data={})
-    entry.add_to_hass(hass)
-    api = AsyncMock()
-    coordinator = NuHeatCoordinator(hass, entry, api)
-    coordinator.async_set_updated_data({"ABC123": thermostat()})
-    entity = NuHeatClimateEntity(coordinator, "ABC123")
+async def test_dynamic_discovery_retains_entities_without_duplicates(hass) -> None:
+    coordinator, api, entry = await coordinator_with(
+        hass, thermostat(), thermostat("XYZ789")
+    )
+    entry.runtime_data = SimpleNamespace(coordinator=coordinator)
+    added: list[NuHeatClimateEntity] = []
+    await async_setup_climate(hass, entry, lambda entities: added.extend(entities))
+    assert {entity.unique_id for entity in added} == {"ABC123", "XYZ789"}
 
-    assert entity.unique_id == "ABC123"
-    assert entity.current_temperature == 21.5
-    assert entity.target_temperature == 23.0
-    assert entity.hvac_mode is HVACMode.HEAT
-    assert entity.hvac_action is HVACAction.HEATING
-    assert entity.preset_mode == "auto"
-    assert entity.available is True
-    assert entity.min_temp == DEFAULT_MIN_TEMP
-    assert entity.max_temp == DEFAULT_MAX_TEMP
-    assert entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE
+    api.list_thermostats.return_value = [thermostat(), thermostat("NEW456")]
+    await coordinator.async_refresh()
+    assert {entity.unique_id for entity in added} == {"ABC123", "XYZ789", "NEW456"}
+    assert "XYZ789" in coordinator.data
+    assert coordinator.is_thermostat_available("XYZ789") is False
+
+    await coordinator.async_refresh()
+    assert len(added) == 3
+    await coordinator.async_shutdown()
+
+
+async def add_entity_state(hass, entity: NuHeatClimateEntity, entity_id: str):
+    entity.hass = hass
+    entity.entity_id = entity_id
+    await entity.async_added_to_hass()
+    entity.async_write_ha_state()
+    await hass.async_block_till_done()
+    return hass.states.get(entity_id)
 
 
 @pytest.mark.asyncio
-async def test_setting_target_temperature(hass):
-    """A HA target write uses the documented Manual endpoint abstraction."""
-    entry = MockConfigEntry(domain=DOMAIN, data={})
-    entry.add_to_hass(hass)
-    api = AsyncMock()
-    updated = thermostat(mode=MODE_MANUAL)
-    api.set_target_temperature.return_value = updated
-    coordinator = NuHeatCoordinator(hass, entry, api)
-    coordinator.async_set_updated_data({"ABC123": thermostat()})
+@pytest.mark.parametrize(
+    ("imperial", "unit", "current", "target", "minimum", "maximum", "write", "celsius"),
+    [
+        (False, UnitOfTemperature.CELSIUS, 21.5, 23.0, 7.0, 35.0, 24.0, 24.0),
+        (True, UnitOfTemperature.FAHRENHEIT, 71.0, 73.0, 45.0, 95.0, 75.2, 24.0),
+    ],
+)
+async def test_climate_state_and_writes_follow_ha_unit(
+    hass, imperial, unit, current, target, minimum, maximum, write, celsius
+) -> None:
+    if imperial:
+        hass.config.units = IMPERIAL_SYSTEM
+    coordinator, api, _ = await coordinator_with(hass, thermostat())
+    api.set_target_temperature.return_value = thermostat(mode=ThermostatMode.MANUAL)
     entity = NuHeatClimateEntity(coordinator, "ABC123")
+    state = await add_entity_state(hass, entity, "climate.nuheat_test")
 
-    await entity.async_set_temperature(temperature=24.0)
+    assert entity.temperature_unit == unit
+    assert state.attributes[ATTR_CURRENT_TEMPERATURE] == pytest.approx(current)
+    assert state.attributes[ATTR_TEMPERATURE] == pytest.approx(target)
+    assert state.attributes["min_temp"] == pytest.approx(minimum)
+    assert state.attributes["max_temp"] == pytest.approx(maximum)
+    assert entity.hvac_mode is HVACMode.HEAT
+    assert entity.hvac_action is HVACAction.HEATING
+    assert entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE
 
-    api.set_target_temperature.assert_awaited_once_with("ABC123", 24.0)
-    assert entity.preset_mode == "manual"
+    await entity.async_set_temperature(temperature=write)
+    api.set_target_temperature.assert_awaited_once_with(
+        "ABC123", pytest.approx(celsius), mode=ScheduleMode.MANUAL
+    )
+    await entity.async_will_remove_from_hass()
+    await coordinator.async_shutdown()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("preset", "schedule_mode", "api_mode"),
     [
-        ("auto", ScheduleMode.AUTO, MODE_AUTO),
-        ("hold", ScheduleMode.HOLD, MODE_HOLD),
-        ("manual", ScheduleMode.MANUAL, MODE_MANUAL),
+        ("auto", ScheduleMode.AUTO, ThermostatMode.AUTO),
+        ("hold", ScheduleMode.HOLD, ThermostatMode.HOLD),
+        ("manual", ScheduleMode.MANUAL, ThermostatMode.MANUAL),
     ],
 )
-async def test_preset_mode_mapping(hass, preset, schedule_mode, api_mode):
-    """HA presets map exactly to the three OpenAPI v2 endpoints."""
-    entry = MockConfigEntry(domain=DOMAIN, data={})
-    entry.add_to_hass(hass)
-    api = AsyncMock()
+async def test_preset_and_mode_mapping(hass, preset, schedule_mode, api_mode) -> None:
+    coordinator, api, _ = await coordinator_with(hass, thermostat())
     api.set_schedule_mode.return_value = thermostat(mode=api_mode)
-    coordinator = NuHeatCoordinator(hass, entry, api)
-    coordinator.async_set_updated_data({"ABC123": thermostat()})
     entity = NuHeatClimateEntity(coordinator, "ABC123")
-
     await entity.async_set_preset_mode(preset)
-
     expected_temperature = None if preset == "auto" else 23.0
     api.set_schedule_mode.assert_awaited_once_with(
         "ABC123", schedule_mode, temperature=expected_temperature
     )
-    assert entity.preset_mode == preset
+    assert preset_for_api_mode(api_mode) == preset
+    assert api_mode_for_preset(preset) is schedule_mode
+    assert setpoint_command_mode() is ScheduleMode.MANUAL
 
 
 @pytest.mark.asyncio
-async def test_refresh_token_rotation_is_stored(hass):
-    """OAuth2Session persists both rotated access and refresh tokens."""
+async def test_refresh_token_rotation_is_stored(hass) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
@@ -309,12 +414,10 @@ async def test_refresh_token_rotation_is_stored(hass):
         },
     )
     entry.add_to_hass(hass)
-    implementation = FakeOAuthImplementation()
-
     with (
         patch(
             "custom_components.nuheat_conductor.async_get_config_entry_implementation",
-            AsyncMock(return_value=implementation),
+            AsyncMock(return_value=FakeOAuthImplementation()),
         ),
         patch(
             "custom_components.nuheat_conductor.NuHeatCoordinator.async_config_entry_first_refresh",
@@ -324,6 +427,30 @@ async def test_refresh_token_rotation_is_stored(hass):
         patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
     ):
         assert await async_setup_entry(hass, entry) is True
-
     assert entry.data[CONF_TOKEN]["access_token"] == "rotated-access"
     assert entry.data[CONF_TOKEN]["refresh_token"] == "rotated-refresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (OAuth2TokenRequestReauthError(), ConfigEntryAuthFailed),
+        (OAuth2TokenRequestTransientError(), ConfigEntryNotReady),
+    ],
+)
+async def test_rejected_and_transient_refresh_tokens(hass, error, expected) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, data=oauth_data())
+    entry.add_to_hass(hass)
+    with (
+        patch(
+            "custom_components.nuheat_conductor.async_get_config_entry_implementation",
+            AsyncMock(return_value=FakeOAuthImplementation()),
+        ),
+        patch(
+            "custom_components.nuheat_conductor.OAuth2Session.async_ensure_token_valid",
+            AsyncMock(side_effect=error),
+        ),
+    ):
+        with pytest.raises(expected):
+            await async_setup_entry(hass, entry)

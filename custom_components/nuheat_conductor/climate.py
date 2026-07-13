@@ -16,31 +16,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util.unit_conversion import TemperatureConverter
+
+from chemelex_nuheat import ScheduleMode, Thermostat
 
 from . import NuHeatConfigEntry
-from .api import ScheduleMode, Thermostat
-from .const import (
-    DOMAIN,
-    MODE_AUTO,
-    MODE_HOLD,
-    MODE_MANUAL,
-    PRESET_AUTO,
-    PRESET_HOLD,
-    PRESET_MANUAL,
-    PRESET_MODES,
-)
+from .behavior import api_mode_for_preset, preset_for_api_mode, setpoint_command_mode
+from .const import DOMAIN, PRESET_MODES
 from .coordinator import NuHeatCoordinator
-
-MODE_TO_PRESET = {
-    MODE_AUTO: PRESET_AUTO,
-    MODE_HOLD: PRESET_HOLD,
-    MODE_MANUAL: PRESET_MANUAL,
-}
-PRESET_TO_MODE = {
-    PRESET_AUTO: ScheduleMode.AUTO,
-    PRESET_HOLD: ScheduleMode.HOLD,
-    PRESET_MANUAL: ScheduleMode.MANUAL,
-}
 
 
 async def async_setup_entry(
@@ -48,12 +31,22 @@ async def async_setup_entry(
     entry: NuHeatConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create one climate entity for every thermostat in the account."""
+    """Create entities initially and when later polls discover thermostats."""
     coordinator = entry.runtime_data.coordinator
-    async_add_entities(
-        NuHeatClimateEntity(coordinator, thermostat.serial_number)
-        for thermostat in coordinator.data.values()
-    )
+    known_serials: set[str] = set()
+
+    def async_add_new_entities() -> None:
+        new_serials = set(coordinator.data or {}) - known_serials
+        if not new_serials:
+            return
+        known_serials.update(new_serials)
+        async_add_entities(
+            NuHeatClimateEntity(coordinator, serial_number)
+            for serial_number in sorted(new_serials)
+        )
+
+    async_add_new_entities()
+    entry.async_on_unload(coordinator.async_add_listener(async_add_new_entities))
 
 
 class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
@@ -66,49 +59,63 @@ class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
     )
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_target_temperature_step = 0.5
 
     def __init__(self, coordinator: NuHeatCoordinator, serial_number: str) -> None:
         super().__init__(coordinator)
         self._serial_number = serial_number
         self._attr_unique_id = serial_number
+        self._attr_temperature_unit = coordinator.hass.config.units.temperature_unit
+        self._attr_target_temperature_step = (
+            0.5 if self._attr_temperature_unit == UnitOfTemperature.CELSIUS else 1.0
+        )
 
     @property
     def thermostat(self) -> Thermostat:
         return self.coordinator.data[self._serial_number]
 
+    def _from_celsius(self, value: float) -> float:
+        return TemperatureConverter.convert(
+            value, UnitOfTemperature.CELSIUS, self.temperature_unit
+        )
+
+    def _to_celsius(self, value: float) -> float:
+        return TemperatureConverter.convert(
+            value, self.temperature_unit, UnitOfTemperature.CELSIUS
+        )
+
     @property
     @override
     def available(self) -> bool:
-        return super().available and self.thermostat.online
+        return super().available and self.coordinator.is_thermostat_available(
+            self._serial_number
+        )
 
     @property
     @override
     def current_temperature(self) -> float:
-        return self.thermostat.current_temperature
+        return self._from_celsius(self.thermostat.current_temperature)
 
     @property
     @override
     def target_temperature(self) -> float:
-        return self.thermostat.target_temperature
+        return self._from_celsius(self.thermostat.target_temperature)
 
     @property
     @override
     def min_temp(self) -> float:
-        native = self.thermostat.min_temperature
-        return native if native is not None else DEFAULT_MIN_TEMP
+        value = self.thermostat.min_temperature
+        return self._from_celsius(DEFAULT_MIN_TEMP if value is None else value)
 
     @property
     @override
     def max_temp(self) -> float:
-        native = self.thermostat.max_temperature
-        return native if native is not None else DEFAULT_MAX_TEMP
+        value = self.thermostat.max_temperature
+        return self._from_celsius(DEFAULT_MAX_TEMP if value is None else value)
 
     @property
     @override
     def hvac_mode(self) -> HVACMode:
-        # OpenAPI v2 has no off endpoint; all three API modes heat as needed.
+        # OpenAPI v2 has no documented off endpoint.
         return HVACMode.HEAT
 
     @property
@@ -119,7 +126,7 @@ class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
     @property
     @override
     def preset_mode(self) -> str:
-        return MODE_TO_PRESET.get(self.thermostat.mode, PRESET_MANUAL)
+        return preset_for_api_mode(self.thermostat.mode)
 
     @override
     async def async_set_temperature(self, **kwargs: Any) -> None:
@@ -127,15 +134,15 @@ class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
         if temperature is None:
             return
         thermostat = await self.coordinator.api.set_target_temperature(
-            self._serial_number, float(temperature)
+            self._serial_number,
+            self._to_celsius(float(temperature)),
+            mode=setpoint_command_mode(),
         )
         self.coordinator.async_update_thermostat(thermostat)
 
     @override
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        mode = PRESET_TO_MODE.get(preset_mode)
-        if mode is None:
-            raise ValueError(f"Unsupported preset mode: {preset_mode}")
+        mode = api_mode_for_preset(preset_mode)
         temperature = (
             None if mode is ScheduleMode.AUTO else self.thermostat.target_temperature
         )
