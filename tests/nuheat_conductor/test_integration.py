@@ -519,6 +519,7 @@ async def test_setup_cloud_failure_is_retryable(hass) -> None:
         },
     )
     entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.SETUP_IN_PROGRESS)
     with (
         patch(
             "custom_components.nuheat_conductor.async_get_config_entry_implementation",
