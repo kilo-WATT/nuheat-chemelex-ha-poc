@@ -7,7 +7,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.application_credentials import ClientCredential
@@ -25,12 +25,17 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.data_entry_flow import AbortFlow, FlowResultType
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers.config_entry_oauth2_flow import (
-    AbstractOAuth2Implementation,
-    LocalOAuth2ImplementationWithPkce,
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
     OAuth2TokenRequestReauthError,
     OAuth2TokenRequestTransientError,
+    ServiceValidationError,
+)
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    AbstractOAuth2Implementation,
+    ImplementationUnavailableError,
+    LocalOAuth2ImplementationWithPkce,
 )
 from homeassistant.util.unit_system import IMPERIAL_SYSTEM
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -43,7 +48,7 @@ from chemelex_nuheat import (
     Thermostat,
     ThermostatMode,
 )
-from custom_components.nuheat_conductor import async_setup_entry
+from custom_components.nuheat_conductor import async_setup_entry, async_unload_entry
 from custom_components.nuheat_conductor.application_credentials import (
     async_get_auth_implementation,
 )
@@ -176,6 +181,19 @@ async def test_missing_credentials_has_helpful_error(hass) -> None:
         "A future official Home Assistant integration should use centrally managed "
         "credentials."
     )
+
+
+@pytest.mark.asyncio
+async def test_oauth_implementation_temporarily_unavailable(hass) -> None:
+    """A cloud implementation lookup failure produces a translated abort."""
+    flow = config_flow(hass)
+    with patch(
+        "homeassistant.helpers.config_entry_oauth2_flow.async_get_implementations",
+        AsyncMock(side_effect=ImplementationUnavailableError("cloud unavailable")),
+    ):
+        result = await flow.async_step_user()
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "oauth_implementation_unavailable"
 
 
 @pytest.mark.asyncio
@@ -312,6 +330,18 @@ async def test_coordinator_first_refresh_and_offline_availability(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_coordinator_auth_failure_triggers_reauthentication(hass) -> None:
+    """Polling auth rejection uses ConfigEntryAuthFailed for HA reauth."""
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    api = AsyncMock()
+    api.list_thermostats.side_effect = NuHeatAuthError("rejected")
+    coordinator = NuHeatCoordinator(hass, entry, api)
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+
+@pytest.mark.asyncio
 async def test_dynamic_discovery_retains_entities_without_duplicates(hass) -> None:
     coordinator, api, entry = await coordinator_with(
         hass, thermostat(), thermostat("XYZ789")
@@ -400,6 +430,17 @@ async def test_preset_and_mode_mapping(hass, preset, schedule_mode, api_mode) ->
 
 
 @pytest.mark.asyncio
+async def test_unsupported_preset_uses_translated_exception(hass) -> None:
+    """Invalid climate input raises HA's translatable validation error."""
+    coordinator, _, _ = await coordinator_with(hass, thermostat())
+    entity = NuHeatClimateEntity(coordinator, "ABC123")
+    with pytest.raises(ServiceValidationError) as raised:
+        await entity.async_set_preset_mode("unsupported")
+    assert raised.value.translation_domain == DOMAIN
+    assert raised.value.translation_key == "unsupported_preset"
+
+
+@pytest.mark.asyncio
 async def test_refresh_token_rotation_is_stored(hass) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -435,8 +476,14 @@ async def test_refresh_token_rotation_is_stored(hass) -> None:
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
-        (OAuth2TokenRequestReauthError(), ConfigEntryAuthFailed),
-        (OAuth2TokenRequestTransientError(), ConfigEntryNotReady),
+        (
+            OAuth2TokenRequestReauthError(domain=DOMAIN, request_info=MagicMock()),
+            ConfigEntryAuthFailed,
+        ),
+        (
+            OAuth2TokenRequestTransientError(domain=DOMAIN, request_info=MagicMock()),
+            ConfigEntryNotReady,
+        ),
     ],
 )
 async def test_rejected_and_transient_refresh_tokens(hass, error, expected) -> None:
@@ -454,3 +501,47 @@ async def test_rejected_and_transient_refresh_tokens(hass, error, expected) -> N
     ):
         with pytest.raises(expected):
             await async_setup_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_setup_cloud_failure_is_retryable(hass) -> None:
+    """A temporary failure during the initial coordinator poll retries setup."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "auth_implementation": "test",
+            CONF_TOKEN: {
+                "access_token": "valid-access",
+                "refresh_token": "refresh",
+                "expires_at": time.time() + 3600,
+                "expires_in": 3600,
+            },
+        },
+    )
+    entry.add_to_hass(hass)
+    with (
+        patch(
+            "custom_components.nuheat_conductor.async_get_config_entry_implementation",
+            AsyncMock(return_value=FakeOAuthImplementation()),
+        ),
+        patch("custom_components.nuheat_conductor.async_get_clientsession"),
+        patch(
+            "custom_components.nuheat_conductor.NuHeatClient.list_thermostats",
+            AsyncMock(side_effect=NuHeatApiError("temporary cloud failure")),
+        ),
+    ):
+        with pytest.raises(ConfigEntryNotReady):
+            await async_setup_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_unload_entry(hass) -> None:
+    """Unload forwards to the configured entity platforms."""
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        AsyncMock(return_value=True),
+    ) as unload:
+        assert await async_unload_entry(hass, entry) is True
+    unload.assert_awaited_once()

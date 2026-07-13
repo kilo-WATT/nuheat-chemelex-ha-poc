@@ -13,8 +13,9 @@ from homeassistant.components.climate.const import (
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util.unit_conversion import TemperatureConverter
 
@@ -29,7 +30,7 @@ from .coordinator import NuHeatCoordinator
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: NuHeatConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Create entities initially and when later polls discover thermostats."""
     coordinator = entry.runtime_data.coordinator
@@ -142,7 +143,14 @@ class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
 
     @override
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        mode = api_mode_for_preset(preset_mode)
+        try:
+            mode = api_mode_for_preset(preset_mode)
+        except ValueError as err:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="unsupported_preset",
+                translation_placeholders={"preset": preset_mode},
+            ) from err
         temperature = (
             None if mode is ScheduleMode.AUTO else self.thermostat.target_temperature
         )

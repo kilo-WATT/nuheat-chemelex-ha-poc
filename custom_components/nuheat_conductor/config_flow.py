@@ -11,6 +11,9 @@ from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlowResult
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_TOKEN
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    ImplementationUnavailableError,
+)
 
 from chemelex_nuheat import (
     NuHeatApiError,
@@ -38,9 +41,14 @@ class NuHeatConductorConfigFlow(
     ) -> ConfigFlowResult:
         """Start with any HA-registered local or cloud OAuth provider."""
         if user_input is None:
-            implementations = await config_entry_oauth2_flow.async_get_implementations(
-                self.hass, DOMAIN
-            )
+            try:
+                implementations = (
+                    await config_entry_oauth2_flow.async_get_implementations(
+                        self.hass, DOMAIN
+                    )
+                )
+            except ImplementationUnavailableError:
+                return self.async_abort(reason="oauth_implementation_unavailable")
             if not implementations:
                 return self.async_abort(reason="missing_oauth_credentials")
         return await super().async_step_user(user_input)

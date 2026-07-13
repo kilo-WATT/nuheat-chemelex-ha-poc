@@ -5,6 +5,7 @@
       "cannot_connect": "Unable to connect to NuHeat.",
       "invalid_auth": "NuHeat rejected the authorization.",
       "missing_oauth_credentials": "OAuth application credentials are required for this development build. A future official Home Assistant integration should use centrally managed credentials.",
+      "oauth_implementation_unavailable": "The NuHeat OAuth service is temporarily unavailable. Try again later.",
       "reauth_account_mismatch": "The linked NuHeat account does not match the existing account."
     },
     "step": {
@@ -16,5 +17,10 @@
   },
   "application_credentials": {
     "description": "For development and local testing, request OAuth credentials from NuHeat/Chemelex using the [OpenAPI documentation]({docs_url}). Do not use credentials extracted from a mobile app. An official integration should use Home Assistant Cloud Account Linking."
+  },
+  "exceptions": {
+    "unsupported_preset": {
+      "message": "The preset {preset} is not supported by NuHeat."
+    }
   }
 }

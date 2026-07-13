@@ -76,8 +76,9 @@ creating their own OAuth application and without publishing a shared secret.
 
 ## Local development
 
-Use the Python version required by current Home Assistant Core (Python 3.13 at
-the time of this readiness pass):
+The external API library supports Python 3.13 and later. Home Assistant Core's
+current development environment requires Python 3.14.2 or later, so Python
+3.14.2 is authoritative for the integration test suite:
 
 ```shell
 python -m venv .venv
@@ -111,6 +112,12 @@ development environment:
 
 Do not perform these steps against a production instance until the integration
 has received review and the live test plan has been completed.
+
+To remove the development integration, delete its config entry from **Settings
+→ Devices & services**, restart Home Assistant, remove
+`custom_components/nuheat_conductor/`, and uninstall the editable
+`chemelex-nuheat` package from that development environment. This does not
+migrate or delete legacy built-in `nuheat` entries.
 
 Temporary debug logging:
 

@@ -8,19 +8,46 @@ permissions:
   contents: read
 
 jobs:
-  quality:
+  home-assistant-current:
+    name: Home Assistant 2026.7 / Python 3.14
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14.2"
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
+      - name: Report authoritative versions
+        run: |
+          python --version
+          python -c "import homeassistant.const as ha; print(f'Home Assistant {ha.__version__}')"
+          python -c "import importlib.metadata as m; print(f'pytest-homeassistant-custom-component {m.version(\"pytest-homeassistant-custom-component\")}')"
       - run: python -m pytest
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
       - run: python -m build
-      - run: python -c "import zipfile; from pathlib import Path; wheel=next(Path('dist').glob('*.whl')); assert 'chemelex_nuheat/py.typed' in zipfile.ZipFile(wheel).namelist()"
+      - name: Validate package typing marker
+        run: python -c "import zipfile; from pathlib import Path; wheel=next(Path('dist').glob('*.whl')); assert 'chemelex_nuheat/py.typed' in zipfile.ZipFile(wheel).namelist()"
+      - name: Parse integration metadata
+        run: python -c "import json, pathlib, yaml; json.load(open('custom_components/nuheat_conductor/manifest.json')); json.load(open('custom_components/nuheat_conductor/strings.json')); [yaml.safe_load(path.read_text()) for path in pathlib.Path('.github').rglob('*.yml')]"
+
+  library-compatibility:
+    name: Library / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e . pytest pytest-asyncio
+      - run: python -m pytest --noconftest -p pytest_asyncio.plugin tests/test_client.py
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
