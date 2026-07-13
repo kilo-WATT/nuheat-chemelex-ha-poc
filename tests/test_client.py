@@ -119,8 +119,9 @@ async def test_get_account() -> None:
 
 @pytest.mark.asyncio
 async def test_setpoint_requires_explicit_mode_and_encodes_centi_celsius() -> None:
+    command_response = FakeResponse(204)
     client, session, _ = make_client(
-        FakeResponse(204), FakeResponse(200, {**THERMOSTAT, "mode": 3})
+        command_response, FakeResponse(200, {**THERMOSTAT, "mode": 3})
     )
 
     thermostat = await client.set_target_temperature(
@@ -135,6 +136,7 @@ async def test_setpoint_requires_explicit_mode_and_encodes_centi_celsius() -> No
         "temperature": 2250,
         "temperatureType": 0,
     }
+    assert command_response.released is True
     with pytest.raises(ValueError, match="requires Hold or Manual"):
         await client.set_target_temperature("ABC123", 22.5, mode=ScheduleMode.AUTO)
 

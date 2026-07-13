@@ -157,9 +157,10 @@ class NuHeatClient:
             payload["holdUntil"] = (
                 hold_until.astimezone(UTC).isoformat().replace("+00:00", "Z")
             )
-        await self._request(
+        response = await self._request(
             "PUT", f"/api/v2/Mode/{schedule_mode.value.title()}", json=payload
         )
+        response.release()
         return await self.get_thermostat(serial_number)
 
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
