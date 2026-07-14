@@ -223,6 +223,10 @@ async def test_successful_oauth_setup(hass) -> None:
             "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Owner@Example.com")),
         ),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
+            AsyncMock(return_value=[thermostat()]),
+        ),
     ):
         result = await flow.async_oauth_create_entry(data)
     assert result["type"] is FlowResultType.CREATE_ENTRY
@@ -243,6 +247,10 @@ async def test_duplicate_account_is_prevented(hass) -> None:
         patch(
             "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Owner@Example.com")),
+        ),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
+            AsyncMock(return_value=[thermostat()]),
         ),
     ):
         with pytest.raises(AbortFlow, match="already_configured"):
@@ -289,6 +297,10 @@ async def test_successful_reauthentication(hass) -> None:
             "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Owner@Example.com")),
         ),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
+            AsyncMock(return_value=[thermostat()]),
+        ),
     ):
         result = await flow.async_oauth_create_entry(oauth_data("new-access"))
     assert result["type"] is FlowResultType.ABORT
@@ -311,6 +323,10 @@ async def test_reauthentication_rejects_wrong_account(hass) -> None:
         patch(
             "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Different@Example.com")),
+        ),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
+            AsyncMock(return_value=[thermostat()]),
         ),
     ):
         with pytest.raises(AbortFlow, match="reauth_account_mismatch"):

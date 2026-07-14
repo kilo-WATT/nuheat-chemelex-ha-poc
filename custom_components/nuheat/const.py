@@ -3,6 +3,7 @@
 from datetime import timedelta
 
 DOMAIN = "nuheat"
+CONF_SERIAL_NUMBER = "serial_number"
 AUTHORIZE_URL = "https://identity.mynuheat.com/connect/authorize"
 TOKEN_URL = "https://identity.mynuheat.com/connect/token"
 OAUTH_SCOPES = ("openid", "openapi", "offline_access")

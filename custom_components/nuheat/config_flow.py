@@ -23,6 +23,12 @@ from chemelex_nuheat import (
 )
 
 from .const import DOMAIN, OAUTH_SCOPES
+from .migration import (
+    OAUTH_CONFIG_ENTRY_VERSION,
+    MigrationAccountMismatchError,
+    async_consolidate_legacy_entries,
+    is_legacy_entry,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,7 +39,7 @@ class NuHeatConfigFlow(
     """Handle NuHeat OAuth2 setup, migration, and reauthentication."""
 
     DOMAIN = DOMAIN
-    VERSION = 1
+    VERSION = OAUTH_CONFIG_ENTRY_VERSION
 
     @override
     async def async_step_user(
@@ -73,6 +79,7 @@ class NuHeatConfigFlow(
         api = NuHeatClient(async_get_clientsession(self.hass), async_access_token)
         try:
             account = await api.get_account()
+            thermostats = await api.list_thermostats()
         except NuHeatAuthError:
             return self.async_abort(reason="invalid_auth")
         except (NuHeatApiError, NuHeatDataError):
@@ -82,9 +89,32 @@ class NuHeatConfigFlow(
         await self.async_set_unique_id(unique_id)
 
         if self.source == SOURCE_REAUTH:
+            entry = self._get_reauth_entry()
+            if is_legacy_entry(entry):
+                try:
+                    result = await async_consolidate_legacy_entries(
+                        self.hass,
+                        entry,
+                        oauth_data=data,
+                        account_unique_id=unique_id,
+                        account_title=account.username,
+                        thermostats=thermostats,
+                    )
+                except MigrationAccountMismatchError:
+                    return self.async_abort(reason="migration_account_mismatch")
+                except Exception:  # noqa: BLE001
+                    return self.async_abort(reason="migration_failed")
+                self.hass.config_entries.async_schedule_reload(
+                    result.anchor_entry.entry_id
+                )
+                return self.async_abort(reason="migration_successful")
+
             self._abort_if_unique_id_mismatch(reason="reauth_account_mismatch")
+            self.hass.config_entries.async_update_entry(
+                entry, version=OAUTH_CONFIG_ENTRY_VERSION
+            )
             return self.async_update_reload_and_abort(
-                self._get_reauth_entry(), title=account.username, data=data
+                entry, title=account.username, data=data
             )
 
         self._abort_if_unique_id_configured()
@@ -94,7 +124,22 @@ class NuHeatConfigFlow(
         self, entry_data: Mapping[str, Any]
     ) -> ConfigFlowResult:
         """Start reauthentication."""
+        if is_legacy_entry(self._get_reauth_entry()):
+            return await self.async_step_migration_confirm()
         return await self.async_step_reauth_confirm()
+
+    async def async_step_migration_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask a legacy user to replace obsolete credentials with OAuth."""
+        entry = self._get_reauth_entry()
+        if user_input is None:
+            return self.async_show_form(
+                step_id="migration_confirm",
+                data_schema=vol.Schema({}),
+                description_placeholders={"thermostat": entry.title},
+            )
+        return await self.async_step_user()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None

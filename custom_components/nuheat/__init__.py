@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_TOKEN, Platform
@@ -23,7 +24,9 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
 
 from chemelex_nuheat import NuHeatApiError, NuHeatAuthError, NuHeatClient
 
+from .const import DOMAIN
 from .coordinator import NuHeatCoordinator
+from .migration import OAUTH_CONFIG_ENTRY_VERSION, is_legacy_entry
 
 PLATFORMS = [Platform.CLIMATE]
 
@@ -42,6 +45,12 @@ type NuHeatConfigEntry = ConfigEntry[NuHeatRuntimeData]
 
 async def async_setup_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bool:
     """Set up NuHeat Conductor from an OAuth config entry."""
+    if is_legacy_entry(entry):
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="legacy_migration_required",
+        )
+
     try:
         implementation = await async_get_config_entry_implementation(hass, entry)
     except ImplementationUnavailableError as err:
@@ -84,3 +93,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bo
 async def async_unload_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bool:
     """Unload NuHeat Conductor."""
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry[Any]) -> bool:
+    """Retain legacy entries until their user-assisted OAuth conversion."""
+    if entry.version > OAUTH_CONFIG_ENTRY_VERSION:
+        return False
+    if is_legacy_entry(entry):
+        # Legacy entries intentionally remain version 1 so their stored schema
+        # is distinguishable and reversible until OAuth validation succeeds.
+        return True
+    if entry.version < OAUTH_CONFIG_ENTRY_VERSION:
+        hass.config_entries.async_update_entry(
+            entry, version=OAUTH_CONFIG_ENTRY_VERSION
+        )
+    return True
