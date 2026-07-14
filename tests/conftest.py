@@ -1,4 +1,4 @@
-"""Home Assistant test fixtures for NuHeat Conductor."""
+"""Home Assistant test fixtures for NuHeat."""
 
 from __future__ import annotations
 

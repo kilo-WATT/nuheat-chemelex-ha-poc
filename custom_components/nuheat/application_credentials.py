@@ -1,4 +1,4 @@
-"""Local Application Credentials fallback for NuHeat Conductor development."""
+"""Local Application Credentials fallback for NuHeat development."""
 
 from homeassistant.components.application_credentials import ClientCredential
 from homeassistant.core import HomeAssistant

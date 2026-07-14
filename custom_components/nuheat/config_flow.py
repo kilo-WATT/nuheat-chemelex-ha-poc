@@ -1,4 +1,4 @@
-"""OAuth config flow for NuHeat Conductor."""
+"""OAuth config flow for NuHeat."""
 
 from __future__ import annotations
 
@@ -27,10 +27,10 @@ from .const import DOMAIN, OAUTH_SCOPES
 _LOGGER = logging.getLogger(__name__)
 
 
-class NuHeatConductorConfigFlow(
+class NuHeatConfigFlow(
     config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
 ):
-    """Handle NuHeat OAuth2 setup and reauthentication."""
+    """Handle NuHeat OAuth2 setup, migration, and reauthentication."""
 
     DOMAIN = DOMAIN
     VERSION = 1

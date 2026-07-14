@@ -1,8 +1,8 @@
-"""Constants for the NuHeat Conductor integration."""
+"""Constants for the NuHeat integration."""
 
 from datetime import timedelta
 
-DOMAIN = "nuheat_conductor"
+DOMAIN = "nuheat"
 AUTHORIZE_URL = "https://identity.mynuheat.com/connect/authorize"
 TOKEN_URL = "https://identity.mynuheat.com/connect/token"
 OAUTH_SCOPES = ("openid", "openapi", "offline_access")

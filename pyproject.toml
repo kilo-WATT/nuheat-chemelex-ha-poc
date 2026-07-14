@@ -59,7 +59,6 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py313"
 line-length = 88
-extend-exclude = ["SmilesGalore-HA-Nuheat-Conductor"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "UP"]

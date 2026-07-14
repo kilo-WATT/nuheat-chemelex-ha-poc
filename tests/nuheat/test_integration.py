@@ -1,4 +1,4 @@
-"""Tests for the NuHeat Conductor custom integration."""
+"""Tests for the NuHeat custom integration."""
 
 from __future__ import annotations
 
@@ -48,24 +48,24 @@ from chemelex_nuheat import (
     Thermostat,
     ThermostatMode,
 )
-from custom_components.nuheat_conductor import async_setup_entry, async_unload_entry
-from custom_components.nuheat_conductor.application_credentials import (
+from custom_components.nuheat import async_setup_entry, async_unload_entry
+from custom_components.nuheat.application_credentials import (
     async_get_auth_implementation,
 )
-from custom_components.nuheat_conductor.behavior import (
+from custom_components.nuheat.behavior import (
     api_mode_for_preset,
     preset_for_api_mode,
     setpoint_command_mode,
 )
-from custom_components.nuheat_conductor.climate import (
+from custom_components.nuheat.climate import (
     NuHeatClimateEntity,
 )
-from custom_components.nuheat_conductor.climate import (
+from custom_components.nuheat.climate import (
     async_setup_entry as async_setup_climate,
 )
-from custom_components.nuheat_conductor.config_flow import NuHeatConductorConfigFlow
-from custom_components.nuheat_conductor.const import DOMAIN
-from custom_components.nuheat_conductor.coordinator import NuHeatCoordinator
+from custom_components.nuheat.config_flow import NuHeatConfigFlow
+from custom_components.nuheat.const import DOMAIN
+from custom_components.nuheat.coordinator import NuHeatCoordinator
 
 
 def thermostat(
@@ -129,8 +129,8 @@ def oauth_data(access_token: str = "not-logged") -> dict:
     }
 
 
-def config_flow(hass, *, source: str = SOURCE_USER) -> NuHeatConductorConfigFlow:
-    flow = NuHeatConductorConfigFlow()
+def config_flow(hass, *, source: str = SOURCE_USER) -> NuHeatConfigFlow:
+    flow = NuHeatConfigFlow()
     flow.hass = hass
     flow.handler = DOMAIN
     flow.context = {"source": source}
@@ -173,9 +173,7 @@ async def test_missing_credentials_has_helpful_error(hass) -> None:
         result = await flow.async_step_user()
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "missing_oauth_credentials"
-    strings = json.loads(
-        Path("custom_components/nuheat_conductor/strings.json").read_text()
-    )
+    strings = json.loads(Path("custom_components/nuheat/strings.json").read_text())
     assert strings["config"]["abort"]["missing_oauth_credentials"] == (
         "OAuth application credentials are required for this development build. "
         "A future official Home Assistant integration should use centrally managed "
@@ -218,9 +216,9 @@ async def test_successful_oauth_setup(hass) -> None:
     flow = config_flow(hass)
     data = oauth_data()
     with (
-        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
+        patch("custom_components.nuheat.config_flow.async_get_clientsession"),
         patch(
-            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Owner@Example.com")),
         ),
     ):
@@ -239,9 +237,9 @@ async def test_duplicate_account_is_prevented(hass) -> None:
     entry.add_to_hass(hass)
     flow = config_flow(hass)
     with (
-        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
+        patch("custom_components.nuheat.config_flow.async_get_clientsession"),
         patch(
-            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Owner@Example.com")),
         ),
     ):
@@ -261,9 +259,9 @@ async def test_account_lookup_failures(hass, error, reason, caplog) -> None:
     flow = config_flow(hass)
     secret = "access-token-must-not-be-logged"
     with (
-        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
+        patch("custom_components.nuheat.config_flow.async_get_clientsession"),
         patch(
-            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(side_effect=error),
         ),
     ):
@@ -284,9 +282,9 @@ async def test_successful_reauthentication(hass) -> None:
     flow = config_flow(hass, source=SOURCE_REAUTH)
     flow.context["entry_id"] = entry.entry_id
     with (
-        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
+        patch("custom_components.nuheat.config_flow.async_get_clientsession"),
         patch(
-            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Owner@Example.com")),
         ),
     ):
@@ -307,9 +305,9 @@ async def test_reauthentication_rejects_wrong_account(hass) -> None:
     flow = config_flow(hass, source=SOURCE_REAUTH)
     flow.context["entry_id"] = entry.entry_id
     with (
-        patch("custom_components.nuheat_conductor.config_flow.async_get_clientsession"),
+        patch("custom_components.nuheat.config_flow.async_get_clientsession"),
         patch(
-            "custom_components.nuheat_conductor.config_flow.NuHeatClient.get_account",
+            "custom_components.nuheat.config_flow.NuHeatClient.get_account",
             AsyncMock(return_value=Account("Different@Example.com")),
         ),
     ):
@@ -457,14 +455,14 @@ async def test_refresh_token_rotation_is_stored(hass) -> None:
     entry.add_to_hass(hass)
     with (
         patch(
-            "custom_components.nuheat_conductor.async_get_config_entry_implementation",
+            "custom_components.nuheat.async_get_config_entry_implementation",
             AsyncMock(return_value=FakeOAuthImplementation()),
         ),
         patch(
-            "custom_components.nuheat_conductor.NuHeatCoordinator.async_config_entry_first_refresh",
+            "custom_components.nuheat.NuHeatCoordinator.async_config_entry_first_refresh",
             AsyncMock(),
         ),
-        patch("custom_components.nuheat_conductor.async_get_clientsession"),
+        patch("custom_components.nuheat.async_get_clientsession"),
         patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
     ):
         assert await async_setup_entry(hass, entry) is True
@@ -491,11 +489,11 @@ async def test_rejected_and_transient_refresh_tokens(hass, error, expected) -> N
     entry.add_to_hass(hass)
     with (
         patch(
-            "custom_components.nuheat_conductor.async_get_config_entry_implementation",
+            "custom_components.nuheat.async_get_config_entry_implementation",
             AsyncMock(return_value=FakeOAuthImplementation()),
         ),
         patch(
-            "custom_components.nuheat_conductor.OAuth2Session.async_ensure_token_valid",
+            "custom_components.nuheat.OAuth2Session.async_ensure_token_valid",
             AsyncMock(side_effect=error),
         ),
     ):
@@ -522,12 +520,12 @@ async def test_setup_cloud_failure_is_retryable(hass) -> None:
     entry.mock_state(hass, ConfigEntryState.SETUP_IN_PROGRESS)
     with (
         patch(
-            "custom_components.nuheat_conductor.async_get_config_entry_implementation",
+            "custom_components.nuheat.async_get_config_entry_implementation",
             AsyncMock(return_value=FakeOAuthImplementation()),
         ),
-        patch("custom_components.nuheat_conductor.async_get_clientsession"),
+        patch("custom_components.nuheat.async_get_clientsession"),
         patch(
-            "custom_components.nuheat_conductor.NuHeatClient.list_thermostats",
+            "custom_components.nuheat.NuHeatClient.list_thermostats",
             AsyncMock(side_effect=NuHeatApiError("temporary cloud failure")),
         ),
     ):

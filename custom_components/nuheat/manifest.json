@@ -1,11 +1,18 @@
 {
-  "domain": "nuheat_conductor",
-  "name": "NuHeat Conductor",
+  "domain": "nuheat",
+  "name": "NuHeat",
   "codeowners": [],
   "config_flow": true,
   "dependencies": ["application_credentials", "auth", "http"],
+  "dhcp": [
+    {
+      "hostname": "nuheat",
+      "macaddress": "002338*"
+    }
+  ],
   "documentation": "https://api.nam.mynuheat.com/",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
+  "loggers": ["chemelex_nuheat"],
   "version": "0.1.0"
 }

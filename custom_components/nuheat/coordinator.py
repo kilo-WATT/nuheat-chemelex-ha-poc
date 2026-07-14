@@ -1,4 +1,4 @@
-"""Data coordinator for NuHeat Conductor."""
+"""Data coordinator for NuHeat."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Climate entities for NuHeat Conductor thermostats."""
+"""Climate entities for NuHeat thermostats."""
 
 from __future__ import annotations
 
