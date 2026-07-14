@@ -18,7 +18,7 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError
 from homeassistant.helpers import (
     area_registry as ar,
 )
@@ -68,7 +68,9 @@ from custom_components.nuheat.registry_migration import (
     build_registry_snapshots,
     transfer_registry_ownership,
 )
+from tests.nuheat.helpers import jwt_access_token
 
+ACCOUNT_SUBJECT = "synthetic-account-subject"
 LEGACY_PASSWORD = "synthetic-legacy-password"
 
 
@@ -95,12 +97,14 @@ def legacy_data(serial_number: str, username: str = "owner@example.com") -> dict
     }
 
 
-def oauth_data(access_token: str = "synthetic-access-token") -> dict:
+def oauth_data(
+    access_token: str | None = None, *, subject: str = ACCOUNT_SUBJECT
+) -> dict:
     """Return synthetic Home Assistant OAuth entry data."""
     return {
         "auth_implementation": "test",
         CONF_TOKEN: {
-            CONF_ACCESS_TOKEN: access_token,
+            CONF_ACCESS_TOKEN: access_token or jwt_access_token(subject),
             "refresh_token": "synthetic-refresh-token",
             "expires_at": 4_000_000_000,
             "expires_in": 3600,
@@ -142,7 +146,7 @@ async def run_migration_flow(
     thermostats: list[Thermostat],
     *,
     account: str = "Owner@Example.com",
-    token: str = "new-synthetic-access",
+    subject: str = ACCOUNT_SUBJECT,
 ):
     """Complete the post-OAuth migration callback with mocked API data."""
     flow = migration_flow(hass, entry)
@@ -162,7 +166,7 @@ async def run_migration_flow(
         ),
         patch("custom_components.nuheat.migration.verify_migration_plan_result"),
     ):
-        return await flow.async_oauth_create_entry(oauth_data(token))
+        return await flow.async_oauth_create_entry(oauth_data(subject=subject))
 
 
 class FakeOAuthImplementation(AbstractOAuth2Implementation):
@@ -246,7 +250,7 @@ def build_three_entry_plan(hass):
     plan = build_migration_plan(
         hass,
         entries[0],
-        account_unique_id="owner@example.com",
+        account_unique_id=ACCOUNT_SUBJECT,
         account_title="Owner@Example.com",
         thermostats=[
             thermostat("ABC123"),
@@ -336,7 +340,7 @@ async def test_legacy_entry_detection_and_setup_requests_migration(hass) -> None
 
 @pytest.mark.asyncio
 async def test_version_one_oauth_entry_advances_without_legacy_data(hass) -> None:
-    """Only the legacy credential schema remains at config-entry version 1."""
+    """A provisional username ID migrates in place to the token subject."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data=oauth_data(),
@@ -344,9 +348,118 @@ async def test_version_one_oauth_entry_advances_without_legacy_data(hass) -> Non
         version=1,
     )
     entry.add_to_hass(hass)
+    entry_id = entry.entry_id
+    original_data = entry.data
+    original_title = entry.title
 
     assert await async_migrate_entry(hass, entry) is True
     assert entry.version == OAUTH_CONFIG_ENTRY_VERSION
+    assert entry.entry_id == entry_id
+    assert entry.unique_id == ACCOUNT_SUBJECT
+    assert entry.data is original_data
+    assert entry.title == original_title
+
+
+@pytest.mark.asyncio
+async def test_provisional_oauth_subject_migration_preserves_registry_identity(
+    hass,
+) -> None:
+    """Changing account identity does not change thermostat-level identity."""
+    data = {
+        **oauth_data(subject=ACCOUNT_SUBJECT),
+        CONF_MIGRATION_STATE: "in_progress",
+        CONF_MIGRATION_VALIDATED_SERIALS: ["ABC123"],
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Owner@Example.com",
+        data=data,
+        unique_id="owner@example.com",
+        version=2,
+    )
+    entry.add_to_hass(hass)
+    records = [create_customized_registry_records(hass, entry, "ABC123")]
+    before = local_state(hass, [entry], records)
+    entry_id = entry.entry_id
+    automation_reference = records[0][0].entity_id
+
+    assert await async_migrate_entry(hass, entry) is True
+
+    assert entry.entry_id == entry_id
+    assert entry.unique_id == ACCOUNT_SUBJECT
+    assert entry.version == OAUTH_CONFIG_ENTRY_VERSION
+    assert entry.title == "Owner@Example.com"
+    assert entry.data == data
+    after = local_state(hass, [entry], records)
+    assert after["entities"] == before["entities"]
+    assert after["devices"] == before["devices"]
+    entity = er.async_get(hass).async_get(automation_reference)
+    assert entity is not None
+    assert entity.entity_id == "climate.master_bath_floor"
+    assert entity.unique_id == "ABC123"
+    assert dr.async_get(hass).async_get(records[0][1].id).id == records[0][1].id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "access_token", ["malformed", jwt_access_token(None), jwt_access_token("")]
+)
+async def test_invalid_provisional_subject_fails_without_mutation_or_logging(
+    hass, caplog, access_token
+) -> None:
+    """An invalid stored subject leaves provisional entries unchanged."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Owner@Example.com",
+        data=oauth_data(access_token),
+        unique_id="owner@example.com",
+        version=2,
+    )
+    entry.add_to_hass(hass)
+    original = (entry.entry_id, entry.unique_id, entry.version, entry.data, entry.title)
+
+    with pytest.raises(ConfigEntryError) as raised:
+        await async_migrate_entry(hass, entry)
+
+    assert raised.value.translation_domain == DOMAIN
+    assert raised.value.translation_key == "oauth_subject_migration_failed"
+    assert (
+        entry.entry_id,
+        entry.unique_id,
+        entry.version,
+        entry.data,
+        entry.title,
+    ) == (original)
+    assert access_token not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_provisional_subject_migration_rejects_duplicate_without_mutation(
+    hass,
+) -> None:
+    """A subject collision is rejected before changing the provisional entry."""
+    existing = MockConfigEntry(
+        domain=DOMAIN,
+        data=oauth_data(subject=ACCOUNT_SUBJECT),
+        unique_id=ACCOUNT_SUBJECT,
+        version=OAUTH_CONFIG_ENTRY_VERSION,
+    )
+    existing.add_to_hass(hass)
+    provisional = MockConfigEntry(
+        domain=DOMAIN,
+        title="Owner@Example.com",
+        data=oauth_data(subject=ACCOUNT_SUBJECT),
+        unique_id="owner@example.com",
+        version=2,
+    )
+    provisional.add_to_hass(hass)
+
+    with pytest.raises(ConfigEntryError) as raised:
+        await async_migrate_entry(hass, provisional)
+
+    assert raised.value.translation_key == "oauth_subject_migration_duplicate"
+    assert provisional.unique_id == "owner@example.com"
+    assert provisional.version == 2
 
 
 @pytest.mark.asyncio
@@ -359,8 +472,10 @@ async def test_one_legacy_entry_becomes_oauth_account(hass) -> None:
     assert result["reason"] == "migration_successful"
     assert hass.config_entries.async_get_entry(entry.entry_id) is entry
     assert entry.version == OAUTH_CONFIG_ENTRY_VERSION
-    assert entry.unique_id == "owner@example.com"
-    assert entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN] == "new-synthetic-access"
+    assert entry.unique_id == ACCOUNT_SUBJECT
+    assert entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN] == jwt_access_token(
+        ACCOUNT_SUBJECT
+    )
     assert CONF_USERNAME not in entry.data
     assert CONF_PASSWORD not in entry.data
     assert CONF_SERIAL_NUMBER not in entry.data
@@ -533,7 +648,9 @@ async def test_oauth_and_api_failures_leave_legacy_state_unchanged(
     entity, device, *_ = create_customized_registry_records(hass, entry, "ABC123")
     original_data = dict(entry.data)
     flow = migration_flow(hass, entry)
-    authorization_code = "synthetic-authorization-code-not-for-logs"
+    authorization_code = jwt_access_token(
+        ACCOUNT_SUBJECT, marker="synthetic-authorization-code-not-for-logs"
+    )
 
     with (
         patch("custom_components.nuheat.config_flow.async_get_clientsession"),
@@ -563,11 +680,12 @@ async def test_existing_oauth_account_absorbs_matching_legacy_entry(hass) -> Non
     account_entry = MockConfigEntry(
         domain=DOMAIN,
         title="Owner@Example.com",
-        data=oauth_data("old-account-token"),
+        data=oauth_data(subject=ACCOUNT_SUBJECT),
         unique_id="owner@example.com",
-        version=OAUTH_CONFIG_ENTRY_VERSION,
+        version=2,
     )
     account_entry.add_to_hass(hass)
+    account_entry_id = account_entry.entry_id
     legacy = add_legacy_entry(hass, "ABC123")
     entity, device, *_ = create_customized_registry_records(hass, legacy, "ABC123")
 
@@ -576,7 +694,12 @@ async def test_existing_oauth_account_absorbs_matching_legacy_entry(hass) -> Non
     assert result["reason"] == "migration_successful"
     assert hass.config_entries.async_get_entry(legacy.entry_id) is None
     assert hass.config_entries.async_entries(DOMAIN) == [account_entry]
-    assert account_entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN] == ("new-synthetic-access")
+    assert account_entry.entry_id == account_entry_id
+    assert account_entry.unique_id == ACCOUNT_SUBJECT
+    assert account_entry.version == OAUTH_CONFIG_ENTRY_VERSION
+    assert account_entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN] == jwt_access_token(
+        ACCOUNT_SUBJECT
+    )
     assert er.async_get(hass).async_get(entity.entity_id).config_entry_id == (
         account_entry.entry_id
     )
@@ -602,7 +725,7 @@ async def test_direct_consolidation_reports_only_confirmed_serials(hass) -> None
             hass,
             anchor,
             oauth_data=oauth_data(),
-            account_unique_id="owner@example.com",
+            account_unique_id=ACCOUNT_SUBJECT,
             account_title="Owner@Example.com",
             thermostats=[thermostat("ABC123")],
         )
@@ -619,7 +742,7 @@ def test_registry_transfer_rejects_an_unexpected_owner(hass) -> None:
     anchor_entry = MockConfigEntry(
         domain=DOMAIN,
         data=oauth_data(),
-        unique_id="owner@example.com",
+        unique_id=ACCOUNT_SUBJECT,
         version=OAUTH_CONFIG_ENTRY_VERSION,
     )
     anchor_entry.add_to_hass(hass)
@@ -663,7 +786,7 @@ def test_migration_plan_is_immutable_and_revalidates_before_execution(hass) -> N
     restarted_plan = build_migration_plan(
         hass,
         entries[0],
-        account_unique_id="owner@example.com",
+        account_unique_id=ACCOUNT_SUBJECT,
         account_title="Owner@Example.com",
         thermostats=[thermostat(serial) for serial in plan.validated_serials],
     )
@@ -912,7 +1035,7 @@ async def test_restart_after_registry_transfer_converges_without_duplicates(
     retry_plan = build_migration_plan(
         hass,
         entries[0],
-        account_unique_id="owner@example.com",
+        account_unique_id=ACCOUNT_SUBJECT,
         account_title="Owner@Example.com",
         thermostats=[thermostat(serial) for serial in plan.validated_serials],
     )
@@ -980,7 +1103,7 @@ async def test_retry_after_successful_rollback_completes(hass) -> None:
     retry_plan = build_migration_plan(
         hass,
         entries[0],
-        account_unique_id="owner@example.com",
+        account_unique_id=ACCOUNT_SUBJECT,
         account_title="Owner@Example.com",
         thermostats=[thermostat(serial) for serial in plan.validated_serials],
     )

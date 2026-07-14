@@ -68,6 +68,10 @@ from custom_components.nuheat.climate import (
 from custom_components.nuheat.config_flow import NuHeatConfigFlow
 from custom_components.nuheat.const import DOMAIN
 from custom_components.nuheat.coordinator import NuHeatCoordinator
+from custom_components.nuheat.migration import OAUTH_CONFIG_ENTRY_VERSION
+from tests.nuheat.helpers import jwt_access_token
+
+ACCOUNT_SUBJECT = "synthetic-account-subject"
 
 
 def thermostat(
@@ -124,10 +128,12 @@ class FakeOAuthImplementation(AbstractOAuth2Implementation):
         }
 
 
-def oauth_data(access_token: str = "not-logged") -> dict:
+def oauth_data(
+    access_token: str | None = None, *, subject: str = ACCOUNT_SUBJECT
+) -> dict:
     return {
         "auth_implementation": "test",
-        CONF_TOKEN: {CONF_ACCESS_TOKEN: access_token},
+        CONF_TOKEN: {CONF_ACCESS_TOKEN: access_token or jwt_access_token(subject)},
     }
 
 
@@ -232,14 +238,12 @@ async def test_successful_oauth_setup(hass) -> None:
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Owner@Example.com"
     assert result["data"] == data
-    assert flow.unique_id == "owner@example.com"
+    assert flow.unique_id == ACCOUNT_SUBJECT
 
 
 @pytest.mark.asyncio
 async def test_duplicate_account_is_prevented(hass) -> None:
-    entry = MockConfigEntry(
-        domain=DOMAIN, data=oauth_data(), unique_id="owner@example.com"
-    )
+    entry = MockConfigEntry(domain=DOMAIN, data=oauth_data(), unique_id=ACCOUNT_SUBJECT)
     entry.add_to_hass(hass)
     flow = config_flow(hass)
     with (
@@ -258,6 +262,43 @@ async def test_duplicate_account_is_prevented(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_provisional_account_migrates_in_place_and_is_rejected(
+    hass,
+) -> None:
+    """Fresh setup recognizes a stored subject behind a provisional ID."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Owner@Example.com",
+        data=oauth_data(subject=ACCOUNT_SUBJECT),
+        unique_id="owner@example.com",
+        version=2,
+    )
+    entry.add_to_hass(hass)
+    entry_id = entry.entry_id
+    original_data = entry.data
+    flow = config_flow(hass)
+    with (
+        patch("custom_components.nuheat.config_flow.async_get_clientsession"),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.get_account",
+            AsyncMock(return_value=Account("Owner@Example.com")),
+        ),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
+            AsyncMock(return_value=[thermostat()]),
+        ),
+    ):
+        with pytest.raises(AbortFlow, match="already_configured"):
+            await flow.async_oauth_create_entry(oauth_data())
+
+    assert entry.entry_id == entry_id
+    assert entry.unique_id == ACCOUNT_SUBJECT
+    assert entry.version == OAUTH_CONFIG_ENTRY_VERSION
+    assert entry.data is original_data
+    assert entry.title == "Owner@Example.com"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "reason"),
     [
@@ -267,7 +308,7 @@ async def test_duplicate_account_is_prevented(hass) -> None:
 )
 async def test_account_lookup_failures(hass, error, reason, caplog) -> None:
     flow = config_flow(hass)
-    secret = "access-token-must-not-be-logged"
+    secret = jwt_access_token(ACCOUNT_SUBJECT, marker="must-not-be-logged")
     with (
         patch("custom_components.nuheat.config_flow.async_get_clientsession"),
         patch(
@@ -284,9 +325,41 @@ async def test_account_lookup_failures(hass, error, reason, caplog) -> None:
 async def test_successful_reauthentication(hass) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data=oauth_data("old-access"),
+        data=oauth_data(subject=ACCOUNT_SUBJECT),
         unique_id="owner@example.com",
         title="Owner@Example.com",
+        version=2,
+    )
+    entry.add_to_hass(hass)
+    flow = config_flow(hass, source=SOURCE_REAUTH)
+    flow.context["entry_id"] = entry.entry_id
+    with (
+        patch("custom_components.nuheat.config_flow.async_get_clientsession"),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.get_account",
+            AsyncMock(return_value=Account("Renamed@Example.com")),
+        ),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
+            AsyncMock(return_value=[thermostat()]),
+        ),
+    ):
+        new_data = oauth_data(subject=ACCOUNT_SUBJECT)
+        result = await flow.async_oauth_create_entry(new_data)
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert entry.data == new_data
+    assert entry.title == "Renamed@Example.com"
+    assert entry.unique_id == ACCOUNT_SUBJECT
+    assert entry.version == OAUTH_CONFIG_ENTRY_VERSION
+
+
+@pytest.mark.asyncio
+async def test_reauthentication_rejects_wrong_account(hass) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=oauth_data(subject=ACCOUNT_SUBJECT),
+        unique_id=ACCOUNT_SUBJECT,
     )
     entry.add_to_hass(hass)
     flow = config_flow(hass, source=SOURCE_REAUTH)
@@ -302,36 +375,82 @@ async def test_successful_reauthentication(hass) -> None:
             AsyncMock(return_value=[thermostat()]),
         ),
     ):
-        result = await flow.async_oauth_create_entry(oauth_data("new-access"))
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "reauth_successful"
-    assert entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN] == "new-access"
+        with pytest.raises(AbortFlow, match="reauth_account_mismatch"):
+            await flow.async_oauth_create_entry(
+                oauth_data(subject="different-synthetic-subject")
+            )
+    assert entry.data == oauth_data(subject=ACCOUNT_SUBJECT)
 
 
 @pytest.mark.asyncio
-async def test_reauthentication_rejects_wrong_account(hass) -> None:
-    entry = MockConfigEntry(
+async def test_same_username_with_different_subject_creates_distinct_account(
+    hass,
+) -> None:
+    """Display usernames do not collapse distinct OAuth subjects."""
+    existing = MockConfigEntry(
         domain=DOMAIN,
-        data=oauth_data("old-access"),
-        unique_id="owner@example.com",
+        data=oauth_data(subject="first-synthetic-subject"),
+        unique_id="first-synthetic-subject",
+        title="Owner@Example.com",
     )
-    entry.add_to_hass(hass)
-    flow = config_flow(hass, source=SOURCE_REAUTH)
-    flow.context["entry_id"] = entry.entry_id
+    existing.add_to_hass(hass)
+    flow = config_flow(hass)
     with (
         patch("custom_components.nuheat.config_flow.async_get_clientsession"),
         patch(
             "custom_components.nuheat.config_flow.NuHeatClient.get_account",
-            AsyncMock(return_value=Account("Different@Example.com")),
+            AsyncMock(return_value=Account("Owner@Example.com")),
         ),
         patch(
             "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
             AsyncMock(return_value=[thermostat()]),
         ),
     ):
-        with pytest.raises(AbortFlow, match="reauth_account_mismatch"):
-            await flow.async_oauth_create_entry(oauth_data("wrong-account"))
-    assert entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN] == "old-access"
+        result = await flow.async_oauth_create_entry(
+            oauth_data(subject="second-synthetic-subject")
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == existing.title
+    assert flow.unique_id == "second-synthetic-subject"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "access_token",
+    [
+        "malformed",
+        jwt_access_token(None),
+        jwt_access_token(""),
+        jwt_access_token("   "),
+    ],
+)
+async def test_missing_or_malformed_subject_aborts_without_api_calls(
+    hass, access_token, caplog
+) -> None:
+    """Invalid token identity cannot create or mutate an account entry."""
+    flow = config_flow(hass)
+    get_account = AsyncMock()
+    list_thermostats = AsyncMock()
+    with (
+        patch("custom_components.nuheat.config_flow.async_get_clientsession"),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.get_account",
+            get_account,
+        ),
+        patch(
+            "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
+            list_thermostats,
+        ),
+    ):
+        result = await flow.async_oauth_create_entry(oauth_data(access_token))
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "invalid_account_identity"
+    get_account.assert_not_awaited()
+    list_thermostats.assert_not_awaited()
+    assert access_token not in caplog.text
+    assert hass.config_entries.async_entries(DOMAIN) == []
 
 
 @pytest.mark.asyncio
