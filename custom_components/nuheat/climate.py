@@ -189,6 +189,5 @@ class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
             serial_number=self._serial_number,
             name=self.thermostat.name or self._serial_number,
             manufacturer="Chemelex / NuHeat",
-            model="NuHeat Conductor",
             suggested_area=self.thermostat.name,
         )

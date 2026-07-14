@@ -9,12 +9,11 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_TOKEN, CONF_USERNAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers import entity_registry as er
 
 from chemelex_nuheat import Thermostat
 
 from .const import CONF_SERIAL_NUMBER, DOMAIN
+from .registry_migration import transfer_legacy_registry_ownership
 
 LEGACY_CONFIG_ENTRY_VERSION = 1
 OAUTH_CONFIG_ENTRY_VERSION = 2
@@ -48,38 +47,6 @@ def is_legacy_entry(entry: ConfigEntry[Any]) -> bool:
 def _legacy_serial(entry: ConfigEntry[Any]) -> str | None:
     value = entry.data.get(CONF_SERIAL_NUMBER)
     return value if isinstance(value, str) and value else None
-
-
-def _transfer_registry_ownership(
-    hass: HomeAssistant,
-    old_entry: ConfigEntry[Any],
-    anchor_entry: ConfigEntry[Any],
-    serial_number: str,
-) -> None:
-    """Move registry associations without recreating entities or devices."""
-    entity_registry = er.async_get(hass)
-    for entity in list(
-        entity_registry.entities.get_entries_for_config_entry_id(old_entry.entry_id)
-    ):
-        if (
-            entity.domain == "climate"
-            and entity.platform == DOMAIN
-            and entity.unique_id == serial_number
-        ):
-            entity_registry.async_update_entity(
-                entity.entity_id, config_entry_id=anchor_entry.entry_id
-            )
-
-    device_registry = dr.async_get(hass)
-    for device in list(
-        device_registry.devices.get_devices_for_config_entry_id(old_entry.entry_id)
-    ):
-        if (DOMAIN, serial_number) in device.identifiers:
-            device_registry.async_update_device(
-                device.id,
-                add_config_entry_id=anchor_entry.entry_id,
-                remove_config_entry_id=old_entry.entry_id,
-            )
 
 
 async def async_consolidate_legacy_entries(
@@ -134,7 +101,7 @@ async def async_consolidate_legacy_entries(
     for entry in redundant_entries:
         serial = _legacy_serial(entry)
         assert serial is not None
-        _transfer_registry_ownership(hass, entry, anchor_entry, serial)
+        transfer_legacy_registry_ownership(hass, entry, anchor_entry, serial)
 
     hass.config_entries.async_update_entry(
         anchor_entry,

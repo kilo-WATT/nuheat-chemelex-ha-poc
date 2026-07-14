@@ -48,6 +48,10 @@ from custom_components.nuheat.migration import (
     is_legacy_entry,
     is_legacy_entry_data,
 )
+from custom_components.nuheat.registry_migration import (
+    RegistryMigrationError,
+    transfer_legacy_registry_ownership,
+)
 
 LEGACY_PASSWORD = "synthetic-legacy-password"
 
@@ -315,6 +319,7 @@ async def test_customized_entity_and_device_survive_initialization(hass) -> None
     assert migrated_device.id == original_device.id
     assert migrated_device.area_id == device_area.id
     assert migrated_device.name_by_user == "Custom device ABC123"
+    assert migrated_device.model == "nVent Signature"
     assert migrated_device.config_entries == {entry.entry_id}
 
 
@@ -498,3 +503,36 @@ async def test_direct_consolidation_reports_only_confirmed_serials(hass) -> None
     assert result.migrated_serials == {"ABC123"}
     assert result.removed_entry_ids == ()
     assert hass.config_entries.async_get_entry(unmatched.entry_id) is unmatched
+
+
+def test_registry_transfer_rejects_an_unexpected_owner(hass) -> None:
+    """A conflicting registry owner aborts instead of recreating the entity."""
+    old_entry = add_legacy_entry(hass, "ABC123")
+    anchor_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=oauth_data(),
+        unique_id="owner@example.com",
+        version=OAUTH_CONFIG_ENTRY_VERSION,
+    )
+    anchor_entry.add_to_hass(hass)
+    unrelated_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=oauth_data("unrelated-token"),
+        unique_id="unrelated@example.com",
+        version=OAUTH_CONFIG_ENTRY_VERSION,
+    )
+    unrelated_entry.add_to_hass(hass)
+    entity = er.async_get(hass).async_get_or_create(
+        CLIMATE_DOMAIN,
+        DOMAIN,
+        "ABC123",
+        config_entry=unrelated_entry,
+        suggested_object_id="conflicting_floor",
+    )
+
+    with pytest.raises(RegistryMigrationError):
+        transfer_legacy_registry_ownership(hass, old_entry, anchor_entry, "ABC123")
+
+    assert er.async_get(hass).async_get(entity.entity_id).config_entry_id == (
+        unrelated_entry.entry_id
+    )
