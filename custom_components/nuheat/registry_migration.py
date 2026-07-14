@@ -169,10 +169,17 @@ def transfer_registry_ownership(
         if device is None or (DOMAIN, snapshot.serial_number) not in device.identifiers:
             raise RegistryMigrationError("NuHeat device disappeared during transfer")
         if snapshot.expected_entry_id in device.config_entries:
+            # Current Home Assistant tracks config-entry and config-subentry
+            # associations together. Add and remove in separate calls so the
+            # second operation starts from the registry's newly stored state.
             device = device_registry.async_update_device(
                 device.id,
                 add_config_entry_id=anchor_entry_id,
-                remove_config_entry_id=snapshot.expected_entry_id,
+            )
+            if device is None:
+                raise RegistryMigrationError("NuHeat device ownership add failed")
+            device = device_registry.async_update_device(
+                device.id, remove_config_entry_id=snapshot.expected_entry_id
             )
         if device is None or device.config_entries != {anchor_entry_id}:
             raise RegistryMigrationError(
