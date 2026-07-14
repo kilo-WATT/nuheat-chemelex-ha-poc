@@ -1,11 +1,10 @@
-"""Registry-preserving helpers for NuHeat config-entry consolidation."""
+"""Registry planning, transfer, verification, and rollback for NuHeat migration."""
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
 
 from homeassistant.components.climate import DOMAIN as CLIMATE_DOMAIN
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -17,46 +16,249 @@ class RegistryMigrationError(RuntimeError):
     """Registry ownership could not be transferred safely."""
 
 
-def transfer_legacy_registry_ownership(
+@dataclass(frozen=True, slots=True)
+class EntityAssociationSnapshot:
+    """Original entity association for one validated thermostat serial."""
+
+    serial_number: str
+    entity_id: str | None
+    expected_entry_id: str | None
+    original_config_entry_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceAssociationSnapshot:
+    """Original device associations for one validated thermostat serial."""
+
+    serial_number: str
+    device_id: str | None
+    expected_entry_id: str | None
+    original_config_entry_ids: frozenset[str]
+
+
+def build_registry_snapshots(
     hass: HomeAssistant,
-    old_entry: ConfigEntry[Any],
-    anchor_entry: ConfigEntry[Any],
-    serial_number: str,
-) -> None:
-    """Transfer associations while retaining the original registry records."""
+    *,
+    serial_entry_ids: tuple[tuple[str, str | None], ...],
+    anchor_entry_id: str,
+) -> tuple[
+    tuple[EntityAssociationSnapshot, ...], tuple[DeviceAssociationSnapshot, ...]
+]:
+    """Preflight all registry ownership without changing any record."""
     entity_registry = er.async_get(hass)
-    entity_id = entity_registry.async_get_entity_id(
-        CLIMATE_DOMAIN, DOMAIN, serial_number
-    )
-    if entity_id is not None:
-        entity = entity_registry.async_get(entity_id)
-        if entity is None:
-            raise RegistryMigrationError("NuHeat entity registry lookup failed")
-        if entity.config_entry_id == old_entry.entry_id:
-            entity = entity_registry.async_update_entity(
-                entity.entity_id, config_entry_id=anchor_entry.entry_id
-            )
-        if entity.config_entry_id != anchor_entry.entry_id:
+    device_registry = dr.async_get(hass)
+    entity_snapshots: list[EntityAssociationSnapshot] = []
+    device_snapshots: list[DeviceAssociationSnapshot] = []
+
+    for serial_number, expected_entry_id in serial_entry_ids:
+        entity_id = entity_registry.async_get_entity_id(
+            CLIMATE_DOMAIN, DOMAIN, serial_number
+        )
+        entity = entity_registry.async_get(entity_id) if entity_id else None
+        allowed_entry_ids = {anchor_entry_id}
+        if expected_entry_id is not None:
+            allowed_entry_ids.add(expected_entry_id)
+        if entity is not None and entity.config_entry_id not in allowed_entry_ids:
             raise RegistryMigrationError(
-                "NuHeat entity belongs to an unexpected config entry"
+                "NuHeat entity belongs to an unrelated config entry"
+            )
+        entity_snapshots.append(
+            EntityAssociationSnapshot(
+                serial_number=serial_number,
+                entity_id=entity.entity_id if entity else None,
+                expected_entry_id=expected_entry_id,
+                original_config_entry_id=entity.config_entry_id if entity else None,
+            )
+        )
+
+        device = device_registry.async_get_device(identifiers={(DOMAIN, serial_number)})
+        if device is not None:
+            if (DOMAIN, serial_number) not in device.identifiers:
+                raise RegistryMigrationError(
+                    "NuHeat device is missing its expected identifier"
+                )
+            if not device.config_entries.issubset(allowed_entry_ids):
+                raise RegistryMigrationError(
+                    "NuHeat device belongs to an unrelated config entry"
+                )
+        device_snapshots.append(
+            DeviceAssociationSnapshot(
+                serial_number=serial_number,
+                device_id=device.id if device else None,
+                expected_entry_id=expected_entry_id,
+                original_config_entry_ids=(
+                    frozenset(device.config_entries) if device else frozenset()
+                ),
+            )
+        )
+
+    return tuple(entity_snapshots), tuple(device_snapshots)
+
+
+def validate_registry_snapshots(
+    hass: HomeAssistant,
+    entity_snapshots: tuple[EntityAssociationSnapshot, ...],
+    device_snapshots: tuple[DeviceAssociationSnapshot, ...],
+) -> None:
+    """Verify registry state has not changed since preflight."""
+    entity_registry = er.async_get(hass)
+    for snapshot in entity_snapshots:
+        current_id = entity_registry.async_get_entity_id(
+            CLIMATE_DOMAIN, DOMAIN, snapshot.serial_number
+        )
+        if current_id != snapshot.entity_id:
+            raise RegistryMigrationError(
+                "NuHeat entity registry changed after preflight"
+            )
+        if current_id is not None:
+            entity = entity_registry.async_get(current_id)
+            if (
+                entity is None
+                or entity.config_entry_id != snapshot.original_config_entry_id
+            ):
+                raise RegistryMigrationError(
+                    "NuHeat entity ownership changed after preflight"
+                )
+
+    device_registry = dr.async_get(hass)
+    for snapshot in device_snapshots:
+        device = device_registry.async_get_device(
+            identifiers={(DOMAIN, snapshot.serial_number)}
+        )
+        if (device.id if device else None) != snapshot.device_id:
+            raise RegistryMigrationError(
+                "NuHeat device registry changed after preflight"
+            )
+        if device is not None and frozenset(device.config_entries) != (
+            snapshot.original_config_entry_ids
+        ):
+            raise RegistryMigrationError(
+                "NuHeat device ownership changed after preflight"
+            )
+
+
+def transfer_registry_ownership(
+    hass: HomeAssistant,
+    *,
+    anchor_entry_id: str,
+    entity_snapshots: tuple[EntityAssociationSnapshot, ...],
+    device_snapshots: tuple[DeviceAssociationSnapshot, ...],
+) -> None:
+    """Transfer existing records to the anchor without recreating them."""
+    entity_registry = er.async_get(hass)
+    for snapshot in entity_snapshots:
+        if snapshot.entity_id is None or snapshot.expected_entry_id is None:
+            continue
+        entity = entity_registry.async_get(snapshot.entity_id)
+        if entity is None:
+            raise RegistryMigrationError("NuHeat entity disappeared during transfer")
+        if entity.config_entry_id == snapshot.expected_entry_id:
+            entity_registry.async_update_entity(
+                entity.entity_id, config_entry_id=anchor_entry_id
+            )
+        elif entity.config_entry_id != anchor_entry_id:
+            raise RegistryMigrationError(
+                "NuHeat entity ownership changed during transfer"
             )
 
     device_registry = dr.async_get(hass)
-    for device in list(
-        device_registry.devices.get_devices_for_config_entry_id(old_entry.entry_id)
-    ):
-        if (DOMAIN, serial_number) not in device.identifiers:
+    for snapshot in device_snapshots:
+        if snapshot.device_id is None or snapshot.expected_entry_id is None:
             continue
-        migrated_device = device_registry.async_update_device(
-            device.id,
-            add_config_entry_id=anchor_entry.entry_id,
-            remove_config_entry_id=old_entry.entry_id,
-        )
-        if (
-            migrated_device is None
-            or anchor_entry.entry_id not in migrated_device.config_entries
-            or old_entry.entry_id in migrated_device.config_entries
-        ):
+        device = device_registry.async_get(snapshot.device_id)
+        if device is None or (DOMAIN, snapshot.serial_number) not in device.identifiers:
+            raise RegistryMigrationError("NuHeat device disappeared during transfer")
+        if snapshot.expected_entry_id in device.config_entries:
+            device = device_registry.async_update_device(
+                device.id,
+                add_config_entry_id=anchor_entry_id,
+                remove_config_entry_id=snapshot.expected_entry_id,
+            )
+        if device is None or device.config_entries != {anchor_entry_id}:
             raise RegistryMigrationError(
-                "NuHeat device registry association transfer failed"
+                "NuHeat device ownership transfer did not converge"
+            )
+
+
+def verify_registry_ownership(
+    hass: HomeAssistant,
+    *,
+    anchor_entry_id: str,
+    serial_numbers: frozenset[str],
+) -> None:
+    """Verify every validated thermostat is exposed by the anchor entry."""
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+    for serial_number in serial_numbers:
+        entity_id = entity_registry.async_get_entity_id(
+            CLIMATE_DOMAIN, DOMAIN, serial_number
+        )
+        entity = entity_registry.async_get(entity_id) if entity_id else None
+        if entity is None or entity.config_entry_id != anchor_entry_id:
+            raise RegistryMigrationError(
+                "NuHeat anchor did not expose every expected entity"
+            )
+        device = device_registry.async_get_device(identifiers={(DOMAIN, serial_number)})
+        if device is None or anchor_entry_id not in device.config_entries:
+            raise RegistryMigrationError(
+                "NuHeat anchor did not expose every expected device"
+            )
+
+
+def restore_registry_snapshots(
+    hass: HomeAssistant,
+    entity_snapshots: tuple[EntityAssociationSnapshot, ...],
+    device_snapshots: tuple[DeviceAssociationSnapshot, ...],
+) -> None:
+    """Restore original associations and remove records created during reload."""
+    entity_registry = er.async_get(hass)
+    for snapshot in entity_snapshots:
+        current_id = entity_registry.async_get_entity_id(
+            CLIMATE_DOMAIN, DOMAIN, snapshot.serial_number
+        )
+        if snapshot.entity_id is None:
+            if current_id is not None:
+                entity_registry.async_remove(current_id)
+            continue
+        if current_id != snapshot.entity_id:
+            raise RegistryMigrationError(
+                "NuHeat entity identity changed during rollback"
+            )
+        entity_registry.async_update_entity(
+            snapshot.entity_id,
+            config_entry_id=snapshot.original_config_entry_id,
+        )
+
+    device_registry = dr.async_get(hass)
+    for snapshot in device_snapshots:
+        device = device_registry.async_get_device(
+            identifiers={(DOMAIN, snapshot.serial_number)}
+        )
+        if snapshot.device_id is None:
+            if device is not None:
+                device_registry.async_remove_device(device.id)
+            continue
+        if device is None or device.id != snapshot.device_id:
+            raise RegistryMigrationError(
+                "NuHeat device identity changed during rollback"
+            )
+
+        for entry_id in snapshot.original_config_entry_ids - device.config_entries:
+            updated = device_registry.async_update_device(
+                device.id, add_config_entry_id=entry_id
+            )
+            if updated is None:
+                raise RegistryMigrationError("NuHeat device rollback add failed")
+            device = updated
+        for entry_id in device.config_entries - snapshot.original_config_entry_ids:
+            updated = device_registry.async_update_device(
+                device.id, remove_config_entry_id=entry_id
+            )
+            if updated is None:
+                raise RegistryMigrationError("NuHeat device rollback remove failed")
+            device = updated
+
+        if frozenset(device.config_entries) != snapshot.original_config_entry_ids:
+            raise RegistryMigrationError(
+                "NuHeat device rollback did not restore ownership"
             )

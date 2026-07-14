@@ -32,5 +32,15 @@
     "unsupported_preset": {
       "message": "The preset {preset} is not supported by NuHeat."
     }
+  },
+  "issues": {
+    "migration_cleanup_incomplete": {
+      "description": "NuHeat account migration succeeded, but one or more obsolete config entries could not be removed. Home Assistant will retry cleanup when the surviving NuHeat account loads. The migrated thermostats remain attached to the account entry. Restore a Home Assistant backup if cleanup cannot be completed.",
+      "title": "NuHeat migration cleanup is incomplete"
+    },
+    "migration_rollback_failed": {
+      "description": "Home Assistant could not completely restore local NuHeat registry or config-entry state after a migration failure. Stop retrying migration and restore the Home Assistant backup made before migration testing.",
+      "title": "NuHeat migration rollback needs manual recovery"
+    }
   }
 }

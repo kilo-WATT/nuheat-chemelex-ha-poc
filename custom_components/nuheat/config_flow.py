@@ -92,7 +92,7 @@ class NuHeatConfigFlow(
             entry = self._get_reauth_entry()
             if is_legacy_entry(entry):
                 try:
-                    result = await async_consolidate_legacy_entries(
+                    await async_consolidate_legacy_entries(
                         self.hass,
                         entry,
                         oauth_data=data,
@@ -104,9 +104,6 @@ class NuHeatConfigFlow(
                     return self.async_abort(reason="migration_account_mismatch")
                 except Exception:  # noqa: BLE001
                     return self.async_abort(reason="migration_failed")
-                self.hass.config_entries.async_schedule_reload(
-                    result.anchor_entry.entry_id
-                )
                 return self.async_abort(reason="migration_successful")
 
             self._abort_if_unique_id_mismatch(reason="reauth_account_mismatch")

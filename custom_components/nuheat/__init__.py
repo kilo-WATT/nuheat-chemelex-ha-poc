@@ -26,7 +26,13 @@ from chemelex_nuheat import NuHeatApiError, NuHeatAuthError, NuHeatClient
 
 from .const import DOMAIN
 from .coordinator import NuHeatCoordinator
-from .migration import OAUTH_CONFIG_ENTRY_VERSION, is_legacy_entry
+from .migration import (
+    OAUTH_CONFIG_ENTRY_VERSION,
+    async_resume_migration_cleanup,
+    is_legacy_entry,
+    is_pending_cleanup_entry,
+    migration_reload_active,
+)
 
 PLATFORMS = [Platform.CLIMATE]
 
@@ -45,6 +51,10 @@ type NuHeatConfigEntry = ConfigEntry[NuHeatRuntimeData]
 
 async def async_setup_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bool:
     """Set up NuHeat from an OAuth config entry."""
+    if is_pending_cleanup_entry(entry):
+        # A deferred cleanup marker has no credentials and must never call the
+        # obsolete API or create duplicate entities.
+        return True
     if is_legacy_entry(entry):
         raise ConfigEntryAuthFailed(
             translation_domain=DOMAIN,
@@ -87,11 +97,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bo
 
     entry.runtime_data = NuHeatRuntimeData(api, coordinator, oauth_session)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    if not migration_reload_active():
+        await async_resume_migration_cleanup(hass, entry)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bool:
     """Unload NuHeat."""
+    if is_pending_cleanup_entry(entry):
+        return True
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
