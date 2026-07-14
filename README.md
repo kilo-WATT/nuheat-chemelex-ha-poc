@@ -7,6 +7,10 @@ and identity contract while replacing obsolete username/password access with
 account-level OAuth. It is development work only and must not be installed on a
 production Home Assistant instance without a backup and maintainer review.
 
+`nuheat-core-replacement` is the canonical development and maintainer-review
+branch. It replaces the existing built-in `nuheat` integration in place; it is
+not a second integration or a fresh-install-only alternative.
+
 ## Repository layout
 
 ```text
@@ -31,6 +35,11 @@ Application Credentials fallback constructs Home Assistant's built-in
 `LocalOAuth2ImplementationWithPkce`. The config flow remains based on
 `AbstractOAuth2FlowHandler`, so a future Cloud Account Linking implementation
 can be registered without changing the API or thermostat code.
+
+The OAuth access token's non-empty `sub` claim is the stable account-level
+config-entry identity, following Home Assistant's existing Chemelex SENZ
+precedent. NuHeat username/email remains display-only. Thermostat serial numbers
+continue to identify climate entities and never inherit the account subject.
 
 No OAuth client ID, client secret, access token, refresh token, authorization
 code, password, or mobile-app credential belongs in this repository.
@@ -59,6 +68,8 @@ entity IDs, names, icons, labels, disabled state, areas, device IDs, device user
 names, and device areas remain on the same registry records. Automations,
 dashboards, history, and scripts that refer to an unchanged entity ID such as
 `climate.master_bath_floor` therefore remain compatible.
+Existing users should not need to rewrite automations, dashboards, scenes,
+scripts, templates, or voice-assistant mappings.
 
 Migration is staged and rollback-aware, not fully atomic. Remote validation and
 local preflight happen before mutation. Registry/config-entry changes are
@@ -73,6 +84,8 @@ failure, restart, and backup contract.
 
 - Base host: `https://api.nam.mynuheat.com`
 - API generation: documented v2 endpoints
+- Product coverage: Chemelex states API v2 supports Signature and Conductor
+  thermostats; live validation of both families remains required
 - Polling: every five minutes
 - Temperatures: centi-Celsius at the HTTP boundary and Celsius in every library
   model
@@ -110,6 +123,10 @@ The intended public path is a Chemelex-issued Home Assistant OAuth application
 managed through Home Assistant Cloud Account Linking. That coordination belongs
 to Chemelex and OHF/Nabu Casa. It should let end users link NuHeat without
 creating their own OAuth application and without publishing a shared secret.
+Chemelex has stated it is ready to issue the official Client ID and Secret.
+Nabu Casa/OHF must provide the required staging and production OAuth return URIs
+and complete account-linking coordination. This repository does not claim that
+official credentials already exist.
 
 ## Local development
 
@@ -178,9 +195,10 @@ all logs before attaching them to an issue.
   identifiers is a release requirement.
 - Official OAuth registration and Cloud Account Linking remain the public
   integration blocker. Local Application Credentials are a development fallback.
-- The domain decision is resolved. Stable account identity, device
-  compatibility, Hold expiration, standby, library ownership, and maintainer
-  approval remain explicit upstream decisions.
+- The domain and stable account identity decisions are resolved: the integration
+  stays `nuheat`, OAuth `sub` identifies an account, and thermostat serials
+  identify entities. Device compatibility, Hold expiration, standby, library
+  ownership, and maintainer approval remain explicit upstream decisions.
 
 Entity preservation cannot guarantee identical cloud behavior. Hold duration,
 standby semantics, unavailable API fields, and the shift from per-thermostat

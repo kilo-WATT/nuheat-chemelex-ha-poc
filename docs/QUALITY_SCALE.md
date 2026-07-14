@@ -28,7 +28,7 @@ new Core integration can claim Bronze. The checklist follows the current
 | `runtime-data` | Satisfied | `NuHeatConfigEntry` is typed as `ConfigEntry[NuHeatRuntimeData]`, and the API, coordinator, and OAuth session are stored in `entry.runtime_data`. |
 | `test-before-configure` | Satisfied | OAuth completion calls both v2 Account and Thermostat endpoints before creating or converting an entry and maps authentication/connection errors to translated abort reasons. |
 | `test-before-setup` | Satisfied | Setup validates/refreshes the OAuth token and performs `async_config_entry_first_refresh`; authentication failures require reauthentication and temporary cloud failures retry setup. |
-| `unique-config-entry` | Satisfied | The normalized account username is the provisional unique ID and duplicate setup is rejected. A vendor-provided immutable account identifier is still preferred. |
+| `unique-config-entry` | Satisfied | The OAuth access token's non-empty `sub` claim identifies the account. Duplicate subjects are rejected; username/email is display-only; provisional username-based entries migrate in place. |
 
 ## Additional readiness requested for review
 
@@ -49,7 +49,7 @@ do not change the incomplete Bronze conclusion above.
 | Legacy identity preservation | Implemented and tested | Tests retain a deliberately customized `climate.master_bath_floor`, its unique ID, custom name/icon/labels/area/disabled state, and its original device record and customization. Config-entry ownership moves before redundant removal. |
 | Migration rollback | Implemented and failure-tested | Immutable preflight rejects changed entries, duplicates, and unrelated registry owners before mutation. Injected failures at entity/device transfer, anchor update/reload/verification, and first cleanup restore original entries and associations. A rollback failure creates a translated repair issue without logging secrets. The first successful redundant-entry removal is explicitly irreversible. |
 | Migration restart and cleanup | Implemented and failure-tested | Non-sensitive anchor/stub markers make interrupted conversion and partial post-boundary cleanup idempotently resumable. Pending stubs never call the obsolete API or create duplicate entities. A persistent translated repair issue remains until cleanup converges. |
-| Test coverage | Incomplete for a tier claim | Tests cover setup, unload, config flow, OAuth refresh/rotation, coordinator updates, discovery, availability, entity writes, legacy migration, consolidation, duplicate prevention, registry ownership, customization, injected rollback failures, the removal boundary, and restart/retry convergence. Formal coverage and maintainer review remain required. |
+| Test coverage | Incomplete for a tier claim | Tests cover setup, unload, config flow, OAuth subject identity and provisional migration, refresh/rotation, coordinator updates, discovery, availability, entity writes, legacy migration, consolidation, duplicate prevention, registry ownership, customization, injected rollback failures, the removal boundary, and restart/retry convergence. Formal coverage and maintainer review remain required. |
 
 ## Conclusion
 
