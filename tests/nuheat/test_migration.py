@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,6 +28,7 @@ from homeassistant.helpers import (
 from homeassistant.helpers import (
     entity_registry as er,
 )
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers import (
     label_registry as lr,
 )
@@ -43,14 +47,26 @@ from custom_components.nuheat import async_migrate_entry, async_setup_entry
 from custom_components.nuheat.config_flow import NuHeatConfigFlow
 from custom_components.nuheat.const import CONF_SERIAL_NUMBER, DOMAIN
 from custom_components.nuheat.migration import (
+    CONF_MIGRATION_STATE,
+    CONF_MIGRATION_VALIDATED_SERIALS,
+    ISSUE_CLEANUP_INCOMPLETE,
+    ISSUE_ROLLBACK_FAILED,
+    MIGRATION_STATE_PENDING_CLEANUP,
     OAUTH_CONFIG_ENTRY_VERSION,
+    MigrationExecutionError,
+    MigrationPreflightError,
     async_consolidate_legacy_entries,
+    async_resume_migration_cleanup,
+    build_migration_plan,
+    execute_migration_plan,
     is_legacy_entry,
     is_legacy_entry_data,
+    validate_migration_plan,
 )
 from custom_components.nuheat.registry_migration import (
     RegistryMigrationError,
-    transfer_legacy_registry_ownership,
+    build_registry_snapshots,
+    transfer_registry_ownership,
 )
 
 LEGACY_PASSWORD = "synthetic-legacy-password"
@@ -140,7 +156,11 @@ async def run_migration_flow(
             "custom_components.nuheat.config_flow.NuHeatClient.list_thermostats",
             AsyncMock(return_value=thermostats),
         ),
-        patch.object(hass.config_entries, "async_schedule_reload"),
+        patch(
+            "custom_components.nuheat.migration._reload_anchor",
+            AsyncMock(),
+        ),
+        patch("custom_components.nuheat.migration.verify_migration_plan_result"),
     ):
         return await flow.async_oauth_create_entry(oauth_data(token))
 
@@ -210,6 +230,87 @@ def create_customized_registry_records(hass, entry, serial_number: str):
         ),
     )
     return entity, device, entity_area, device_area, label
+
+
+def build_three_entry_plan(hass):
+    """Build a migration plan with enough records for first/later failures."""
+    entries = [
+        add_legacy_entry(hass, "ABC123"),
+        add_legacy_entry(hass, "XYZ789"),
+        add_legacy_entry(hass, "LMN456"),
+    ]
+    records = [
+        create_customized_registry_records(hass, entry, serial)
+        for entry, serial in zip(entries, ("ABC123", "XYZ789", "LMN456"), strict=True)
+    ]
+    plan = build_migration_plan(
+        hass,
+        entries[0],
+        account_unique_id="owner@example.com",
+        account_title="Owner@Example.com",
+        thermostats=[
+            thermostat("ABC123"),
+            thermostat("XYZ789"),
+            thermostat("LMN456"),
+        ],
+    )
+    return entries, records, plan
+
+
+def local_state(hass, entries, records):
+    """Capture config and registry fields that migration must preserve."""
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+    return {
+        "entries": {
+            entry.entry_id: (
+                dict(entry.data),
+                entry.title,
+                entry.unique_id,
+                entry.version,
+            )
+            for entry in entries
+            if hass.config_entries.async_get_entry(entry.entry_id) is not None
+        },
+        "entities": {
+            entity.id: (
+                entity_registry.async_get(entity.entity_id).entity_id,
+                entity_registry.async_get(entity.entity_id).config_entry_id,
+                entity_registry.async_get(entity.entity_id).name,
+                entity_registry.async_get(entity.entity_id).icon,
+                entity_registry.async_get(entity.entity_id).area_id,
+                entity_registry.async_get(entity.entity_id).disabled_by,
+                entity_registry.async_get(entity.entity_id).labels,
+                entity_registry.async_get(entity.entity_id).device_id,
+            )
+            for entity, *_ in records
+        },
+        "devices": {
+            device.id: (
+                device_registry.async_get(device.id).config_entries,
+                device_registry.async_get(device.id).identifiers,
+                device_registry.async_get(device.id).name,
+                device_registry.async_get(device.id).name_by_user,
+                device_registry.async_get(device.id).area_id,
+                device_registry.async_get(device.id).model,
+            )
+            for _, device, *_ in records
+        },
+    }
+
+
+def fail_nth_call(original, occurrence: int):
+    """Return a sync wrapper that fails once at the requested call."""
+    calls = 0
+
+    def wrapped(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == occurrence:
+            raise RuntimeError("synthetic mutation failure")
+        return original(*args, **kwargs)
+
+    return wrapped
 
 
 @pytest.mark.asyncio
@@ -490,14 +591,21 @@ async def test_direct_consolidation_reports_only_confirmed_serials(hass) -> None
     anchor = add_legacy_entry(hass, "ABC123")
     unmatched = add_legacy_entry(hass, "XYZ789")
 
-    result = await async_consolidate_legacy_entries(
-        hass,
-        anchor,
-        oauth_data=oauth_data(),
-        account_unique_id="owner@example.com",
-        account_title="Owner@Example.com",
-        thermostats=[thermostat("ABC123")],
-    )
+    with (
+        patch(
+            "custom_components.nuheat.migration._reload_anchor",
+            AsyncMock(),
+        ),
+        patch("custom_components.nuheat.migration.verify_migration_plan_result"),
+    ):
+        result = await async_consolidate_legacy_entries(
+            hass,
+            anchor,
+            oauth_data=oauth_data(),
+            account_unique_id="owner@example.com",
+            account_title="Owner@Example.com",
+            thermostats=[thermostat("ABC123")],
+        )
 
     assert result.anchor_entry is anchor
     assert result.migrated_serials == {"ABC123"}
@@ -531,8 +639,359 @@ def test_registry_transfer_rejects_an_unexpected_owner(hass) -> None:
     )
 
     with pytest.raises(RegistryMigrationError):
-        transfer_legacy_registry_ownership(hass, old_entry, anchor_entry, "ABC123")
+        build_registry_snapshots(
+            hass,
+            serial_entry_ids=(("ABC123", old_entry.entry_id),),
+            anchor_entry_id=anchor_entry.entry_id,
+        )
 
     assert er.async_get(hass).async_get(entity.entity_id).config_entry_id == (
         unrelated_entry.entry_id
     )
+
+
+def test_migration_plan_is_immutable_and_revalidates_before_execution(hass) -> None:
+    """The detached preflight plan rejects later local-state changes."""
+    entries, records, plan = build_three_entry_plan(hass)
+    before = local_state(hass, entries, records)
+
+    with pytest.raises(FrozenInstanceError):
+        plan.anchor_entry_id = "replacement"  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        plan.original_anchor_data[CONF_PASSWORD] = "changed"  # type: ignore[index]
+
+    restarted_plan = build_migration_plan(
+        hass,
+        entries[0],
+        account_unique_id="owner@example.com",
+        account_title="Owner@Example.com",
+        thermostats=[thermostat(serial) for serial in plan.validated_serials],
+    )
+    assert restarted_plan.anchor_entry_id == plan.anchor_entry_id
+    assert restarted_plan.redundant_entry_ids == plan.redundant_entry_ids
+    assert restarted_plan.entity_snapshots == plan.entity_snapshots
+    assert restarted_plan.device_snapshots == plan.device_snapshots
+
+    duplicate = MockConfigEntry(
+        domain=DOMAIN,
+        data=oauth_data("duplicate-token"),
+        unique_id=plan.account_unique_id,
+        version=OAUTH_CONFIG_ENTRY_VERSION,
+    )
+    duplicate.add_to_hass(hass)
+    with pytest.raises(MigrationPreflightError):
+        validate_migration_plan(hass, plan)
+
+    assert local_state(hass, entries, records) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_point", "occurrence"),
+    [
+        ("entity", 1),
+        ("entity", 2),
+        ("device", 1),
+        ("device", 2),
+        ("anchor_update", 1),
+        ("reload", 1),
+        ("verification", 1),
+        ("first_cleanup", 1),
+    ],
+)
+async def test_pre_boundary_failures_restore_exact_local_state(
+    hass, caplog, failure_point, occurrence
+) -> None:
+    """Every failure before the first removal restores original local state."""
+    entries, records, plan = build_three_entry_plan(hass)
+    unrelated = add_legacy_entry(hass, "OTHER1", username="unrelated@example.invalid")
+    before = local_state(hass, entries + [unrelated], records)
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+    original_remove = hass.config_entries.async_remove
+
+    async def fail_first_remove(entry_id):
+        raise RuntimeError("synthetic cleanup failure")
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("custom_components.nuheat.migration._reload_anchor", AsyncMock())
+        )
+        stack.enter_context(
+            patch("custom_components.nuheat.migration.verify_migration_plan_result")
+        )
+        if failure_point == "entity":
+            stack.enter_context(
+                patch.object(
+                    entity_registry,
+                    "async_update_entity",
+                    side_effect=fail_nth_call(
+                        entity_registry.async_update_entity, occurrence
+                    ),
+                )
+            )
+        elif failure_point == "device":
+            stack.enter_context(
+                patch.object(
+                    device_registry,
+                    "async_update_device",
+                    side_effect=fail_nth_call(
+                        device_registry.async_update_device, occurrence
+                    ),
+                )
+            )
+        elif failure_point == "anchor_update":
+            stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_update_entry",
+                    side_effect=fail_nth_call(
+                        hass.config_entries.async_update_entry, occurrence
+                    ),
+                )
+            )
+        elif failure_point == "reload":
+            stack.enter_context(
+                patch(
+                    "custom_components.nuheat.migration._reload_anchor",
+                    AsyncMock(side_effect=RuntimeError("synthetic reload failure")),
+                )
+            )
+        elif failure_point == "verification":
+            stack.enter_context(
+                patch(
+                    "custom_components.nuheat.migration.verify_migration_plan_result",
+                    side_effect=RuntimeError("synthetic verification failure"),
+                )
+            )
+        elif failure_point == "first_cleanup":
+            stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_remove",
+                    side_effect=fail_first_remove,
+                )
+            )
+
+        with pytest.raises(MigrationExecutionError):
+            await execute_migration_plan(hass, plan, oauth_data=oauth_data())
+
+    assert hass.config_entries.async_remove == original_remove
+    assert local_state(hass, entries + [unrelated], records) == before
+    assert len(er.async_get(hass).entities) == 3
+    assert len(dr.async_get(hass).devices) == 3
+    assert LEGACY_PASSWORD not in caplog.text
+    assert "synthetic-access-token" not in caplog.text
+    assert "synthetic-refresh-token" not in caplog.text
+    issue_reg = ir.async_get(hass)
+    assert (
+        issue_reg.async_get_issue(
+            DOMAIN, f"{ISSUE_ROLLBACK_FAILED}_{plan.anchor_entry_id}"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_later_cleanup_failure_is_resumable_after_restart(hass) -> None:
+    """Cleanup after the removal boundary leaves a usable, retryable anchor."""
+    entries, records, plan = build_three_entry_plan(hass)
+    unrelated = add_legacy_entry(hass, "OTHER1", username="unrelated@example.invalid")
+    unrelated_data = dict(unrelated.data)
+    original_remove = hass.config_entries.async_remove
+    remove_calls = 0
+
+    async def fail_second_remove(entry_id):
+        nonlocal remove_calls
+        remove_calls += 1
+        if remove_calls == 2:
+            raise RuntimeError("synthetic later cleanup failure")
+        return await original_remove(entry_id)
+
+    with (
+        patch("custom_components.nuheat.migration._reload_anchor", AsyncMock()),
+        patch("custom_components.nuheat.migration.verify_migration_plan_result"),
+        patch.object(
+            hass.config_entries, "async_remove", side_effect=fail_second_remove
+        ),
+    ):
+        result = await execute_migration_plan(hass, plan, oauth_data=oauth_data())
+
+    assert result.cleanup_complete is False
+    assert len(result.removed_entry_ids) == 1
+    assert len(result.pending_cleanup_entry_ids) == 1
+    assert CONF_PASSWORD not in entries[0].data
+    assert entries[0].data[CONF_MIGRATION_STATE]
+    pending = hass.config_entries.async_get_entry(result.pending_cleanup_entry_ids[0])
+    assert pending is not None
+    assert pending.data[CONF_MIGRATION_STATE] == MIGRATION_STATE_PENDING_CLEANUP
+    assert hass.config_entries.async_get_entry(unrelated.entry_id) is unrelated
+    assert unrelated.data == unrelated_data
+    assert (
+        ir.async_get(hass).async_get_issue(
+            DOMAIN, f"{ISSUE_CLEANUP_INCOMPLETE}_{plan.anchor_entry_id}"
+        )
+        is not None
+    )
+
+    entries[0].runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            data={serial: thermostat(serial) for serial in plan.validated_serials}
+        )
+    )
+    await async_resume_migration_cleanup(hass, entries[0])
+
+    assert hass.config_entries.async_get_entry(pending.entry_id) is None
+    assert CONF_MIGRATION_STATE not in entries[0].data
+    assert CONF_MIGRATION_VALIDATED_SERIALS not in entries[0].data
+    assert CONF_PASSWORD not in entries[0].data
+    assert hass.config_entries.async_get_entry(unrelated.entry_id) is unrelated
+    assert (
+        ir.async_get(hass).async_get_issue(
+            DOMAIN, f"{ISSUE_CLEANUP_INCOMPLETE}_{plan.anchor_entry_id}"
+        )
+        is None
+    )
+    for entity, device, *_ in records:
+        assert er.async_get(hass).async_get(entity.entity_id).id == entity.id
+        assert er.async_get(hass).async_get(entity.entity_id).config_entry_id == (
+            entries[0].entry_id
+        )
+        assert dr.async_get(hass).async_get(device.id).config_entries == {
+            entries[0].entry_id
+        }
+
+
+@pytest.mark.asyncio
+async def test_rollback_failure_creates_secret_free_repair_issue(hass, caplog) -> None:
+    """Incomplete restoration is visible without logging credential values."""
+    entries, _, plan = build_three_entry_plan(hass)
+    entity_registry = er.async_get(hass)
+
+    with (
+        patch.object(
+            entity_registry,
+            "async_update_entity",
+            side_effect=RuntimeError("synthetic registry failure"),
+        ),
+        patch("custom_components.nuheat.migration._reload_anchor", AsyncMock()),
+        patch("custom_components.nuheat.migration.verify_migration_plan_result"),
+    ):
+        with pytest.raises(MigrationExecutionError):
+            await execute_migration_plan(hass, plan, oauth_data=oauth_data())
+
+    assert (
+        ir.async_get(hass).async_get_issue(
+            DOMAIN, f"{ISSUE_ROLLBACK_FAILED}_{entries[0].entry_id}"
+        )
+        is not None
+    )
+    assert "restoration from backup may be required" in caplog.text
+    for secret in (
+        LEGACY_PASSWORD,
+        "synthetic-access-token",
+        "synthetic-refresh-token",
+        "synthetic-authorization-code",
+    ):
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_restart_after_registry_transfer_converges_without_duplicates(
+    hass,
+) -> None:
+    """A process stop after ownership transfer is safe to plan and retry."""
+    entries, records, plan = build_three_entry_plan(hass)
+    transfer_registry_ownership(
+        hass,
+        anchor_entry_id=plan.anchor_entry_id,
+        entity_snapshots=plan.entity_snapshots,
+        device_snapshots=plan.device_snapshots,
+    )
+
+    retry_plan = build_migration_plan(
+        hass,
+        entries[0],
+        account_unique_id="owner@example.com",
+        account_title="Owner@Example.com",
+        thermostats=[thermostat(serial) for serial in plan.validated_serials],
+    )
+    with (
+        patch("custom_components.nuheat.migration._reload_anchor", AsyncMock()),
+        patch("custom_components.nuheat.migration.verify_migration_plan_result"),
+    ):
+        result = await execute_migration_plan(hass, retry_plan, oauth_data=oauth_data())
+
+    assert result.cleanup_complete is True
+    assert hass.config_entries.async_entries(DOMAIN) == [entries[0]]
+    assert CONF_PASSWORD not in entries[0].data
+    assert len(er.async_get(hass).entities) == len(records)
+    assert len(dr.async_get(hass).devices) == len(records)
+
+
+@pytest.mark.asyncio
+async def test_restart_after_anchor_conversion_resumes_cleanup(hass) -> None:
+    """A process stop after durable markers converges during next setup."""
+    entries, records, plan = build_three_entry_plan(hass)
+    with (
+        patch(
+            "custom_components.nuheat.migration._reload_anchor",
+            AsyncMock(side_effect=KeyboardInterrupt),
+        ),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        await execute_migration_plan(hass, plan, oauth_data=oauth_data())
+
+    assert entries[0].data[CONF_MIGRATION_STATE]
+    assert entries[0].data[CONF_PASSWORD] == LEGACY_PASSWORD
+    assert all(
+        entry.data[CONF_MIGRATION_STATE] == MIGRATION_STATE_PENDING_CLEANUP
+        for entry in entries[1:]
+    )
+    entries[0].runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            data={serial: thermostat(serial) for serial in plan.validated_serials}
+        )
+    )
+
+    await async_resume_migration_cleanup(hass, entries[0])
+
+    assert hass.config_entries.async_entries(DOMAIN) == [entries[0]]
+    assert CONF_PASSWORD not in entries[0].data
+    assert CONF_MIGRATION_STATE not in entries[0].data
+    assert len(er.async_get(hass).entities) == len(records)
+    assert len(dr.async_get(hass).devices) == len(records)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_successful_rollback_completes(hass) -> None:
+    """A rolled-back migration can be planned again and completed."""
+    entries, records, plan = build_three_entry_plan(hass)
+    with (
+        patch(
+            "custom_components.nuheat.migration._reload_anchor",
+            AsyncMock(side_effect=RuntimeError("synthetic first-attempt failure")),
+        ),
+        patch("custom_components.nuheat.migration.verify_migration_plan_result"),
+        pytest.raises(MigrationExecutionError),
+    ):
+        await execute_migration_plan(hass, plan, oauth_data=oauth_data())
+
+    retry_plan = build_migration_plan(
+        hass,
+        entries[0],
+        account_unique_id="owner@example.com",
+        account_title="Owner@Example.com",
+        thermostats=[thermostat(serial) for serial in plan.validated_serials],
+    )
+    with (
+        patch("custom_components.nuheat.migration._reload_anchor", AsyncMock()),
+        patch("custom_components.nuheat.migration.verify_migration_plan_result"),
+    ):
+        result = await execute_migration_plan(hass, retry_plan, oauth_data=oauth_data())
+
+    assert result.cleanup_complete is True
+    assert hass.config_entries.async_entries(DOMAIN) == [entries[0]]
+    assert CONF_PASSWORD not in entries[0].data
+    assert len(er.async_get(hass).entities) == len(records)
+    assert len(dr.async_get(hass).devices) == len(records)
