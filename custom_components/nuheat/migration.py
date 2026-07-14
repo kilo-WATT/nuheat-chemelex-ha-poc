@@ -77,6 +77,11 @@ async def async_consolidate_legacy_entries(
         and (serial := _legacy_serial(entry)) is not None
         and serial in discovered_serials
     ]
+    migrated_serials = frozenset(
+        serial
+        for entry in matching_legacy_entries
+        if (serial := _legacy_serial(entry)) is not None
+    )
 
     existing_account_entry = next(
         (
@@ -119,9 +124,5 @@ async def async_consolidate_legacy_entries(
     return MigrationResult(
         anchor_entry=anchor_entry,
         removed_entry_ids=tuple(entry.entry_id for entry in redundant_entries),
-        migrated_serials=frozenset(
-            serial
-            for entry in matching_legacy_entries
-            if (serial := _legacy_serial(entry)) is not None
-        ),
+        migrated_serials=migrated_serials,
     )
