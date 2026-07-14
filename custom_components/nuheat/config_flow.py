@@ -22,6 +22,10 @@ from chemelex_nuheat import (
     NuHeatDataError,
 )
 
+from .account_identity import (
+    InvalidAccountSubjectError,
+    account_subject_from_entry_data,
+)
 from .const import DOMAIN, OAUTH_SCOPES
 from .migration import (
     OAUTH_CONFIG_ENTRY_VERSION,
@@ -73,6 +77,11 @@ class NuHeatConfigFlow(
     async def async_oauth_create_entry(self, data: dict[str, Any]) -> ConfigFlowResult:
         token = data[CONF_TOKEN]
 
+        try:
+            unique_id = account_subject_from_entry_data(data)
+        except InvalidAccountSubjectError:
+            return self.async_abort(reason="invalid_account_identity")
+
         async def async_access_token(force_refresh: bool) -> str:
             return token[CONF_ACCESS_TOKEN]
 
@@ -85,7 +94,6 @@ class NuHeatConfigFlow(
         except (NuHeatApiError, NuHeatDataError):
             return self.async_abort(reason="cannot_connect")
 
-        unique_id = account.username.casefold()
         await self.async_set_unique_id(unique_id)
 
         if self.source == SOURCE_REAUTH:
@@ -106,6 +114,17 @@ class NuHeatConfigFlow(
                     return self.async_abort(reason="migration_failed")
                 return self.async_abort(reason="migration_successful")
 
+            if entry.unique_id != unique_id:
+                try:
+                    stored_subject = account_subject_from_entry_data(entry.data)
+                except InvalidAccountSubjectError:
+                    stored_subject = None
+                if stored_subject == unique_id:
+                    self.hass.config_entries.async_update_entry(
+                        entry,
+                        unique_id=unique_id,
+                        version=OAUTH_CONFIG_ENTRY_VERSION,
+                    )
             self._abort_if_unique_id_mismatch(reason="reauth_account_mismatch")
             self.hass.config_entries.async_update_entry(
                 entry, version=OAUTH_CONFIG_ENTRY_VERSION
@@ -114,6 +133,20 @@ class NuHeatConfigFlow(
                 entry, title=account.username, data=data
             )
 
+        for existing_entry in self.hass.config_entries.async_entries(DOMAIN):
+            if existing_entry.unique_id == unique_id:
+                continue
+            try:
+                stored_subject = account_subject_from_entry_data(existing_entry.data)
+            except InvalidAccountSubjectError:
+                continue
+            if stored_subject == unique_id:
+                self.hass.config_entries.async_update_entry(
+                    existing_entry,
+                    unique_id=unique_id,
+                    version=OAUTH_CONFIG_ENTRY_VERSION,
+                )
+                break
         self._abort_if_unique_id_configured()
         return self.async_create_entry(title=account.username, data=data)
 

@@ -10,6 +10,7 @@ from homeassistant.const import CONF_TOKEN, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
+    ConfigEntryError,
     ConfigEntryNotReady,
     OAuth2TokenRequestError,
     OAuth2TokenRequestReauthError,
@@ -24,6 +25,10 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
 
 from chemelex_nuheat import NuHeatApiError, NuHeatAuthError, NuHeatClient
 
+from .account_identity import (
+    InvalidAccountSubjectError,
+    account_subject_from_entry_data,
+)
 from .const import DOMAIN
 from .coordinator import NuHeatCoordinator
 from .migration import (
@@ -117,8 +122,34 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry[Any]) -> b
         # Legacy entries intentionally remain version 1 so their stored schema
         # is distinguishable and reversible until OAuth validation succeeds.
         return True
+    if is_pending_cleanup_entry(entry):
+        if entry.version < OAUTH_CONFIG_ENTRY_VERSION:
+            hass.config_entries.async_update_entry(
+                entry, version=OAUTH_CONFIG_ENTRY_VERSION
+            )
+        return True
     if entry.version < OAUTH_CONFIG_ENTRY_VERSION:
+        try:
+            account_subject = account_subject_from_entry_data(entry.data)
+        except InvalidAccountSubjectError as err:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="oauth_subject_migration_failed",
+            ) from err
+
+        if any(
+            other.entry_id != entry.entry_id
+            and other.unique_id == account_subject
+            and not is_pending_cleanup_entry(other)
+            for other in hass.config_entries.async_entries(DOMAIN)
+        ):
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="oauth_subject_migration_duplicate",
+            )
         hass.config_entries.async_update_entry(
-            entry, version=OAUTH_CONFIG_ENTRY_VERSION
+            entry,
+            unique_id=account_subject,
+            version=OAUTH_CONFIG_ENTRY_VERSION,
         )
     return True

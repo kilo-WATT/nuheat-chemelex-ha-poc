@@ -17,6 +17,10 @@ from homeassistant.helpers import issue_registry as ir
 
 from chemelex_nuheat import Thermostat
 
+from .account_identity import (
+    InvalidAccountSubjectError,
+    account_subject_from_entry_data,
+)
 from .const import CONF_SERIAL_NUMBER, DOMAIN
 from .registry_migration import (
     DeviceAssociationSnapshot,
@@ -29,7 +33,7 @@ from .registry_migration import (
 )
 
 LEGACY_CONFIG_ENTRY_VERSION = 1
-OAUTH_CONFIG_ENTRY_VERSION = 2
+OAUTH_CONFIG_ENTRY_VERSION = 3
 
 CONF_MIGRATION_STATE = "migration_state"
 CONF_MIGRATION_ANCHOR_ENTRY_ID = "migration_anchor_entry_id"
@@ -163,6 +167,14 @@ def _pending_serial(entry: ConfigEntry[Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _oauth_entry_subject(entry: ConfigEntry[Any]) -> str | None:
+    """Return a stored OAuth subject without exposing token contents."""
+    try:
+        return account_subject_from_entry_data(entry.data)
+    except InvalidAccountSubjectError:
+        return None
+
+
 def _issue_id(issue_type: str, anchor_entry_id: str) -> str:
     return f"{issue_type}_{anchor_entry_id}"
 
@@ -212,9 +224,12 @@ def build_migration_plan(
         entry
         for entry in domain_entries
         if entry.entry_id != initiating_entry.entry_id
-        and entry.unique_id == account_unique_id
         and CONF_TOKEN in entry.data
         and not is_pending_cleanup_entry(entry)
+        and (
+            entry.unique_id == account_unique_id
+            or _oauth_entry_subject(entry) == account_unique_id
+        )
     ]
     if len(account_entries) > 1:
         raise MigrationPreflightError("Duplicate NuHeat account entry appeared")
@@ -308,9 +323,12 @@ def validate_migration_plan(hass: HomeAssistant, plan: MigrationPlan) -> None:
         entry
         for entry in hass.config_entries.async_entries(DOMAIN)
         if entry.entry_id != plan.anchor_entry_id
-        and entry.unique_id == plan.account_unique_id
         and CONF_TOKEN in entry.data
         and not is_pending_cleanup_entry(entry)
+        and (
+            entry.unique_id == plan.account_unique_id
+            or _oauth_entry_subject(entry) == plan.account_unique_id
+        )
     ]
     if duplicates:
         raise MigrationPreflightError("Duplicate NuHeat account entry appeared")
