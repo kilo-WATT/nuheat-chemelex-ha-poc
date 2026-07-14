@@ -1,4 +1,4 @@
-"""NuHeat Conductor custom integration."""
+"""NuHeat custom integration."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ type NuHeatConfigEntry = ConfigEntry[NuHeatRuntimeData]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bool:
-    """Set up NuHeat Conductor from an OAuth config entry."""
+    """Set up NuHeat from an OAuth config entry."""
     if is_legacy_entry(entry):
         raise ConfigEntryAuthFailed(
             translation_domain=DOMAIN,
@@ -91,7 +91,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bo
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> bool:
-    """Unload NuHeat Conductor."""
+    """Unload NuHeat."""
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

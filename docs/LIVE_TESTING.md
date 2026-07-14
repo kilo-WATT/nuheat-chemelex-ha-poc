@@ -23,18 +23,28 @@ Record pass, fail, not supported, or not tested for each applicable combination.
 | Offline | Disconnect one thermostat | Entity becomes unavailable and is not removed or duplicated. |
 | Dynamic discovery | Add a thermostat after setup | Entity appears after a later poll without reloading the integration. |
 | Temporary omission | API list omits a known thermostat once | Existing entity remains registered and becomes unavailable until it returns. |
+| One legacy entry | One backed-up legacy thermostat entry | Interactive OAuth converts that same entry; entity and device IDs/customization remain unchanged; password is removed only after validation. |
+| Multiple legacy entries | Two or more matching thermostats | One account entry remains, every entity/device registry record is reused, and redundant config-entry associations are transferred. |
+| Multiple accounts | Authenticate one of two legacy accounts | Only exact serials returned by the authenticated account are consolidated; the other account remains untouched. |
+| Wrong account | Authenticate an account without the initiating serial | Migration aborts without changing entries, credentials, entities, or devices. |
+| Partial migration discovery | Omit one expected serial from a sanitized mocked/vendor-controlled response | The omitted legacy entry and its registry records remain unchanged for a later attempt. |
 
 ## Procedure
 
 1. Record Home Assistant version, integration commit, thermostat family/model,
    firmware version if visible, account size, and configured HA temperature unit.
-2. Capture the physical thermostat's displayed current temperature, target, and
+2. Create a full Home Assistant backup. For migration tests, record sanitized
+   registry metadata and automation references before starting OAuth.
+3. Capture the physical thermostat's displayed current temperature, target, and
    mode before each test.
-3. Enable the sanitized debug logging configuration from the README.
-4. Perform one matrix action at a time and wait for the API/UI state to settle.
-5. Record expected versus observed behavior and whether a restart or next poll
+4. Enable the sanitized debug logging configuration from the README.
+5. Perform one matrix action at a time and wait for the API/UI state to settle.
+6. Record expected versus observed behavior and whether a restart or next poll
    changed the result.
-6. Disable debug logging and review every attachment before submitting a report.
+7. For migration cases, verify entity IDs, history visibility, dashboard cards,
+   automations, entity/device custom names, icons, labels, disabled state, and
+   areas after restart.
+8. Disable debug logging and review every attachment before submitting a report.
 
 ## Safe report contents
 

@@ -1,15 +1,16 @@
 # NuHeat / Chemelex Home Assistant proof of concept
 
-This repository contains a review-oriented Home Assistant custom integration
-and a typed async library for the documented Chemelex NuHeat OpenAPI v2. It is
-development work only: it does not replace Home Assistant's built-in `nuheat`
-integration, migrate existing entries, publish a package, or modify a live Home
-Assistant configuration.
+This repository contains a review-oriented replacement prototype for Home
+Assistant's existing `nuheat` integration and a typed async library for the
+documented Chemelex NuHeat OpenAPI v2. It retains the existing `nuheat` domain
+and identity contract while replacing obsolete username/password access with
+account-level OAuth. It is development work only and must not be installed on a
+production Home Assistant instance without a backup and maintainer review.
 
 ## Repository layout
 
 ```text
-custom_components/nuheat_conductor/  Home Assistant proof-of-concept integration
+custom_components/nuheat/            Replacement proof-of-concept integration
 src/chemelex_nuheat/                  HA-independent aiohttp API library
 tests/                               Mocked API and integration tests
 docs/                                Upstream decisions and live-testing plan
@@ -34,6 +35,31 @@ can be registered without changing the API or thermostat code.
 No OAuth client ID, client secret, access token, refresh token, authorization
 code, password, or mobile-app credential belongs in this repository.
 
+## Replacement and migration contract
+
+The replacement intentionally preserves the public identity established by the
+built-in integration:
+
+- integration domain: `nuheat`;
+- entity platform: `climate`;
+- entity unique ID: the thermostat serial number, unchanged;
+- device identifier: `(nuheat, serial_number)`, unchanged.
+
+Legacy entries contain one username/password/serial tuple per thermostat. A
+legacy entry remains unchanged and requests interactive reauthentication until
+the user completes OAuth. After the authenticated account and thermostat list
+are validated, the initiating entry becomes the account entry. Only other
+legacy entries whose exact serial numbers are returned by that account are
+consolidated. Registry ownership is transferred to the surviving entry before
+redundant entries are removed. Unmatched or temporarily omitted entries remain
+unchanged for a later attempt.
+
+Migration tests pre-create customized entity and device records and verify that
+entity IDs, names, icons, labels, disabled state, areas, device IDs, device user
+names, and device areas remain on the same registry records. Automations,
+dashboards, history, and scripts that refer to an unchanged entity ID such as
+`climate.master_bath_floor` therefore remain compatible.
+
 ## API behavior
 
 - Base host: `https://api.nam.mynuheat.com`
@@ -41,8 +67,10 @@ code, password, or mobile-app credential belongs in this repository.
 - Polling: every five minutes
 - Temperatures: centi-Celsius at the HTTP boundary and Celsius in every library
   model
-- Modes: Auto, Hold, and Manual; there is no exposed Off mode without a
-  documented and tested endpoint
+- API modes: Auto, Hold, and Manual
+- Home Assistant compatibility: `HVACMode.AUTO`, `HVACMode.HEAT`, `Run
+  Schedule`, `Temporary Hold`, and `Permanent Hold`
+- Off: not exposed without a documented and tested endpoint
 - Limits: v2 has not been confirmed to expose native thermostat min/max values;
   conservative defaults exist only in the Home Assistant entity
 - Discovery: later coordinator refreshes add newly discovered thermostats while
@@ -103,21 +131,20 @@ development environment:
 1. Clone this repository.
 2. Install the library into the same Python environment with
    `python -m pip install -e /path/to/repository`.
-3. Copy `custom_components/nuheat_conductor/` to
-   `<config>/custom_components/nuheat_conductor/`.
+3. Copy `custom_components/nuheat/` to `<config>/custom_components/nuheat/`.
 4. Restart the development Home Assistant instance.
 5. Add legitimate Chemelex development credentials under **Settings → Devices
    & services → Application credentials**.
-6. Add **NuHeat Conductor** and complete the OAuth consent flow.
+6. Add **NuHeat** and complete the OAuth consent flow.
 
 Do not perform these steps against a production instance until the integration
 has received review and the live test plan has been completed.
 
-To remove the development integration, delete its config entry from **Settings
-→ Devices & services**, restart Home Assistant, remove
-`custom_components/nuheat_conductor/`, and uninstall the editable
-`chemelex-nuheat` package from that development environment. This does not
-migrate or delete legacy built-in `nuheat` entries.
+This custom component shadows the built-in `nuheat` integration and is suitable
+only for a disposable development instance. Before testing migration, back up
+Home Assistant through its supported backup feature. After a successful
+migration, restoring that backup is the supported way to return to the obsolete
+legacy-entry data during PoC testing. Do not manually edit storage files.
 
 Temporary debug logging:
 
@@ -125,7 +152,7 @@ Temporary debug logging:
 logger:
   default: info
   logs:
-    custom_components.nuheat_conductor: debug
+    custom_components.nuheat: debug
     chemelex_nuheat: debug
 ```
 
@@ -136,12 +163,19 @@ all logs before attaching them to an issue.
 
 - The old MyNuHeat username/password API used by Home Assistant's existing
   integration appears obsolete after the Chemelex platform migration.
-- This proof of concept uses the official NuHeat OpenAPI v2 design and the NAM
-  API host identified by Chemelex.
+- This proof of concept targets in-place replacement of the built-in `nuheat`
+  integration using official NuHeat OpenAPI v2 and the NAM API host.
+- Retaining serial-number entity unique IDs and `(nuheat, serial)` device
+  identifiers is a release requirement.
 - Official OAuth registration and Cloud Account Linking remain the public
   integration blocker. Local Application Credentials are a development fallback.
-- Domain choice, migration strategy, device compatibility, setpoint semantics,
-  standby, and stable account identity remain explicit upstream decisions.
+- The domain decision is resolved. Stable account identity, device
+  compatibility, Hold expiration, standby, library ownership, and maintainer
+  approval remain explicit upstream decisions.
+
+Entity preservation cannot guarantee identical cloud behavior. Hold duration,
+standby semantics, unavailable API fields, and the shift from per-thermostat
+entries to one account entry still require live validation.
 
 See [docs/UPSTREAM_DECISIONS.md](docs/UPSTREAM_DECISIONS.md) for the complete
 decision record.
