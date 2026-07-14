@@ -60,6 +60,15 @@ names, and device areas remain on the same registry records. Automations,
 dashboards, history, and scripts that refer to an unchanged entity ID such as
 `climate.master_bath_floor` therefore remain compatible.
 
+Migration is staged and rollback-aware, not fully atomic. Remote validation and
+local preflight happen before mutation. Registry/config-entry changes are
+restored if verification fails before cleanup, but the first successfully
+removed redundant config entry is an irreversible boundary. Later cleanup
+failures leave a working OAuth anchor, are retried on its next setup, and create
+a translated repair issue while incomplete. See
+[`docs/MIGRATION_ATOMICITY.md`](docs/MIGRATION_ATOMICITY.md) for the exact
+failure, restart, and backup contract.
+
 ## API behavior
 
 - Base host: `https://api.nam.mynuheat.com`
