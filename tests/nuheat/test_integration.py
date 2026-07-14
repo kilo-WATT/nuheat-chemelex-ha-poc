@@ -53,7 +53,9 @@ from custom_components.nuheat.application_credentials import (
     async_get_auth_implementation,
 )
 from custom_components.nuheat.behavior import (
+    api_mode_for_hvac_mode,
     api_mode_for_preset,
+    hvac_mode_for_api_mode,
     preset_for_api_mode,
     setpoint_command_mode,
 )
@@ -392,13 +394,13 @@ async def test_climate_state_and_writes_follow_ha_unit(
     assert state.attributes[ATTR_TEMPERATURE] == pytest.approx(target)
     assert state.attributes["min_temp"] == pytest.approx(minimum)
     assert state.attributes["max_temp"] == pytest.approx(maximum)
-    assert entity.hvac_mode is HVACMode.HEAT
+    assert entity.hvac_mode is HVACMode.AUTO
     assert entity.hvac_action is HVACAction.HEATING
     assert entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE
 
     await entity.async_set_temperature(temperature=write)
     api.set_target_temperature.assert_awaited_once_with(
-        "ABC123", pytest.approx(celsius), mode=ScheduleMode.MANUAL
+        "ABC123", pytest.approx(celsius), mode=ScheduleMode.HOLD
     )
     await entity.async_will_remove_from_hass()
     await coordinator.async_shutdown()
@@ -408,9 +410,9 @@ async def test_climate_state_and_writes_follow_ha_unit(
 @pytest.mark.parametrize(
     ("preset", "schedule_mode", "api_mode"),
     [
-        ("auto", ScheduleMode.AUTO, ThermostatMode.AUTO),
-        ("hold", ScheduleMode.HOLD, ThermostatMode.HOLD),
-        ("manual", ScheduleMode.MANUAL, ThermostatMode.MANUAL),
+        ("Run Schedule", ScheduleMode.AUTO, ThermostatMode.AUTO),
+        ("Temporary Hold", ScheduleMode.HOLD, ThermostatMode.HOLD),
+        ("Permanent Hold", ScheduleMode.MANUAL, ThermostatMode.MANUAL),
     ],
 )
 async def test_preset_and_mode_mapping(hass, preset, schedule_mode, api_mode) -> None:
@@ -418,13 +420,59 @@ async def test_preset_and_mode_mapping(hass, preset, schedule_mode, api_mode) ->
     api.set_schedule_mode.return_value = thermostat(mode=api_mode)
     entity = NuHeatClimateEntity(coordinator, "ABC123")
     await entity.async_set_preset_mode(preset)
-    expected_temperature = None if preset == "auto" else 23.0
+    expected_temperature = None if preset == "Run Schedule" else 23.0
     api.set_schedule_mode.assert_awaited_once_with(
         "ABC123", schedule_mode, temperature=expected_temperature
     )
     assert preset_for_api_mode(api_mode) == preset
     assert api_mode_for_preset(preset) is schedule_mode
-    assert setpoint_command_mode() is ScheduleMode.MANUAL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hvac_mode", "schedule_mode", "api_mode", "temperature"),
+    [
+        (HVACMode.AUTO, ScheduleMode.AUTO, ThermostatMode.AUTO, None),
+        (HVACMode.HEAT, ScheduleMode.MANUAL, ThermostatMode.MANUAL, 23.0),
+    ],
+)
+async def test_legacy_hvac_mode_service_calls(
+    hass, hvac_mode, schedule_mode, api_mode, temperature
+) -> None:
+    """Existing AUTO and HEAT service calls retain their public behavior."""
+    coordinator, api, _ = await coordinator_with(hass, thermostat())
+    api.set_schedule_mode.return_value = thermostat(mode=api_mode)
+    entity = NuHeatClimateEntity(coordinator, "ABC123")
+    assert entity.hvac_modes == [HVACMode.AUTO, HVACMode.HEAT]
+    assert entity.preset_modes == [
+        "Run Schedule",
+        "Temporary Hold",
+        "Permanent Hold",
+    ]
+
+    await entity.async_set_hvac_mode(hvac_mode)
+
+    api.set_schedule_mode.assert_awaited_once_with(
+        "ABC123", schedule_mode, temperature=temperature
+    )
+    assert api_mode_for_hvac_mode(hvac_mode) is schedule_mode
+    assert hvac_mode_for_api_mode(api_mode) is hvac_mode
+
+
+@pytest.mark.parametrize(
+    ("api_mode", "requested_hvac_mode", "expected"),
+    [
+        (ThermostatMode.AUTO, None, ScheduleMode.HOLD),
+        (ThermostatMode.HOLD, None, ScheduleMode.HOLD),
+        (ThermostatMode.MANUAL, None, ScheduleMode.MANUAL),
+        (ThermostatMode.AUTO, HVACMode.HEAT, ScheduleMode.MANUAL),
+    ],
+)
+def test_setpoint_compatibility_mapping(
+    api_mode, requested_hvac_mode, expected
+) -> None:
+    """Setpoints isolate temporary-Hold versus Manual compatibility policy."""
+    assert setpoint_command_mode(api_mode, requested_hvac_mode) is expected
 
 
 @pytest.mark.asyncio

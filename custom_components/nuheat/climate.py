@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any, override
 
-from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
+from homeassistant.components.climate import (
+    ATTR_HVAC_MODE,
+    ClimateEntity,
+    ClimateEntityFeature,
+)
 from homeassistant.components.climate.const import (
     DEFAULT_MAX_TEMP,
     DEFAULT_MIN_TEMP,
@@ -22,7 +26,13 @@ from homeassistant.util.unit_conversion import TemperatureConverter
 from chemelex_nuheat import ScheduleMode, Thermostat
 
 from . import NuHeatConfigEntry
-from .behavior import api_mode_for_preset, preset_for_api_mode, setpoint_command_mode
+from .behavior import (
+    api_mode_for_hvac_mode,
+    api_mode_for_preset,
+    hvac_mode_for_api_mode,
+    preset_for_api_mode,
+    setpoint_command_mode,
+)
 from .const import DOMAIN, PRESET_MODES
 from .coordinator import NuHeatCoordinator
 
@@ -55,7 +65,7 @@ class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
 
     _attr_has_entity_name = True
     _attr_name = None
-    _attr_hvac_modes = [HVACMode.HEAT]
+    _attr_hvac_modes = [HVACMode.AUTO, HVACMode.HEAT]
     _attr_preset_modes = PRESET_MODES
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
@@ -116,8 +126,7 @@ class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
     @property
     @override
     def hvac_mode(self) -> HVACMode:
-        # OpenAPI v2 has no documented off endpoint.
-        return HVACMode.HEAT
+        return hvac_mode_for_api_mode(self.thermostat.mode)
 
     @property
     @override
@@ -137,7 +146,20 @@ class NuHeatClimateEntity(CoordinatorEntity[NuHeatCoordinator], ClimateEntity):
         thermostat = await self.coordinator.api.set_target_temperature(
             self._serial_number,
             self._to_celsius(float(temperature)),
-            mode=setpoint_command_mode(),
+            mode=setpoint_command_mode(
+                self.thermostat.mode, kwargs.get(ATTR_HVAC_MODE)
+            ),
+        )
+        self.coordinator.async_update_thermostat(thermostat)
+
+    @override
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        mode = api_mode_for_hvac_mode(hvac_mode)
+        temperature = (
+            None if mode is ScheduleMode.AUTO else self.thermostat.target_temperature
+        )
+        thermostat = await self.coordinator.api.set_schedule_mode(
+            self._serial_number, mode, temperature=temperature
         )
         self.coordinator.async_update_thermostat(thermostat)
 
